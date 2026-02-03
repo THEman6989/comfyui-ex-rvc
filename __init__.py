@@ -192,10 +192,185 @@ class RVC_Terminal_Node:
 
         return (result_audio,)
 
+
+import torch
+import numpy as np
+import os
+from PIL import Image, ImageOps, ImageSequence
+import folder_paths
+import json
+
+# --- HILFSFUNKTIONEN (Damit keine externen Dependencies nötig sind) ---
+
+def tensor2pil(image):
+    # Konvertiert einen Batch von Tensoren in eine Liste von PIL Bildern
+    batch_count = image.size(0) if len(image.shape) > 3 else 1
+    if batch_count > 1:
+        out = []
+        for i in range(batch_count):
+            out.append(Image.fromarray(np.clip(255. * image[i].cpu().numpy(), 0, 255).astype(np.uint8)))
+        return out
+    return [Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))]
+
+def pil2tensor(image):
+    # Konvertiert PIL Bilder zurück in Tensoren
+    if isinstance(image, list):
+        out = []
+        for img in image:
+            out.append(torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0))
+        return torch.cat(out, dim=0)
+    
+    return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
+
+# --- NODES ---
+
+class Standalone_OverlayTransparentImage:
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                "back_image": ("IMAGE",),
+                "overlay_image": ("IMAGE",),
+                "transparency": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1}),
+                "offset_x": ("INT", {"default": 0, "min": -4096, "max": 4096}),
+                "offset_y": ("INT", {"default": 0, "min": -4096, "max": 4096}),
+                "rotation_angle": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.1}),
+                "overlay_scale_factor": ("FLOAT", {"default": 1.000, "min": 0.000, "max": 100.000, "step": 0.001}),
+                }        
+        }
+
+    RETURN_TYPES = ("IMAGE", )
+    FUNCTION = "overlay_image"
+    CATEGORY = "Standalone/Graphics"
+
+    def overlay_image(self, back_image, overlay_image, 
+                      transparency, offset_x, offset_y, rotation_angle, overlay_scale_factor=1.0):
+
+        # Konvertiere Input Tensoren zu PIL Listen
+        back_images_pil = tensor2pil(back_image)
+        overlay_images_pil = tensor2pil(overlay_image)
+        
+        results = []
+
+        # Iteriere über die Hintergrund-Bilder (unterstützt Batch/Video)
+        for i, bg_img in enumerate(back_images_pil):
+            
+            # Wähle das passende Overlay Bild. 
+            # Wenn Overlay weniger Frames hat als Hintergrund, wird das letzte wiederholt (oder Modulo, hier: wiederholen des ersten, wenn nur 1)
+            if i < len(overlay_images_pil):
+                ov_img = overlay_images_pil[i]
+            else:
+                # Fallback: Nimm das letzte verfügbare Overlay oder das erste, wenn es nur eins ist
+                ov_img = overlay_images_pil[-1] if len(overlay_images_pil) > 0 else overlay_images_pil[0]
+
+            # --- Original Logik Start ---
+            
+            # Kopie erstellen, damit wir das Original im Cache nicht verändern
+            current_overlay = ov_img.copy()
+            current_bg = bg_img.copy()
+
+            # Apply transparency to overlay image
+            if current_overlay.mode != 'RGBA':
+                current_overlay = current_overlay.convert('RGBA')
+            
+            # Transparenz setzen
+            alpha = current_overlay.split()[3]
+            alpha = ImageOps.scale(alpha, 1, int(255 * (1 - transparency)))
+            current_overlay.putalpha(alpha)
+
+            # Rotate overlay image
+            current_overlay = current_overlay.rotate(rotation_angle, expand=True)
+
+            # Scale overlay image
+            overlay_width, overlay_height = current_overlay.size
+            new_size = (int(overlay_width * overlay_scale_factor), int(overlay_height * overlay_scale_factor))
+            
+            # Sicherheitscheck, falls size 0 wird
+            if new_size[0] > 0 and new_size[1] > 0:
+                current_overlay = current_overlay.resize(new_size, Image.Resampling.LANCZOS)
+
+            # Calculate centered position relative to the center of the background image
+            center_x = current_bg.width // 2
+            center_y = current_bg.height // 2
+            position_x = center_x - current_overlay.width // 2 + offset_x
+            position_y = center_y - current_overlay.height // 2 + offset_y
+
+            # Paste the rotated overlay image onto the back image
+            # Wir konvertieren Hintergrund zu RGBA für das Pasting, falls er es nicht ist
+            if current_bg.mode != 'RGBA':
+                current_bg = current_bg.convert('RGBA')
+                
+            current_bg.paste(current_overlay, (position_x, position_y), current_overlay)
+            
+            # Zurück zu RGB für den Output (optional, aber meist erwartet)
+            current_bg = current_bg.convert('RGB')
+            
+            # --- Original Logik Ende ---
+            
+            results.append(current_bg)
+
+        # Liste von PIL Bildern zurück zu Tensor Batch
+        return (pil2tensor(results),)
+
+
+class Standalone_SaveImageClean:
+    """
+    Speichert Bilder OHNE Metadaten (kein Workflow JSON, kein EXIF).
+    """
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": 
+                    {"images": ("IMAGE", ),
+                     "filename_prefix": ("STRING", {"default": "clean_image"})},
+                }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_images_clean"
+    OUTPUT_NODE = True
+    CATEGORY = "Standalone/IO"
+
+    def save_images_clean(self, images, filename_prefix="clean_image"):
+        filename_prefix += self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
+        
+        results = list()
+        
+        # Konvertieren zu PIL
+        pil_images = tensor2pil(images)
+
+        for image in pil_images:
+            file = f"{filename}_{counter:05}_.png"
+            
+            # Ein neues Bild erstellen, um sicherzugehen, dass keine 'info' kopiert wird
+            clean_image = Image.new(image.mode, image.size)
+            clean_image.putdata(image.getdata())
+            
+            # Speichern ohne pnginfo Parameter -> Keine Metadaten
+            clean_image.save(os.path.join(full_output_folder, file), format="PNG", compress_level=4)
+            
+            results.append({
+                "filename": file,
+                "subfolder": subfolder,
+                "type": self.type
+            })
+            counter += 1
+
+        return { "ui": { "images": results } }
+
+
 NODE_CLASS_MAPPINGS = {
-    "RVC_Terminal_Node": RVC_Terminal_Node
+    "RVC_Terminal_Node": RVC_Terminal_Node,
+     "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
+    "Standalone_SaveImageClean": Standalone_SaveImageClean,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RVC_Terminal_Node": "RVC Terminal (Fixed Paths)"
+    "RVC_Terminal_Node": "RVC Terminal (Fixed Paths)",
+    "Standalone_OverlayTransparentImage": "Overlay Image (Video Supported)",
+    "Standalone_SaveImageClean": "Save Image (No Metadata)",
 }
