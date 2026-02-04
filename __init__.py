@@ -196,14 +196,13 @@ class RVC_Terminal_Node:
 import torch
 import numpy as np
 import os
-from PIL import Image, ImageOps, ImageSequence
+from PIL import Image, ImageOps
 import folder_paths
-import json
 
-# --- HILFSFUNKTIONEN (Damit keine externen Dependencies nötig sind) ---
+# --- HILFSFUNKTIONEN ---
 
 def tensor2pil(image):
-    # Konvertiert einen Batch von Tensoren in eine Liste von PIL Bildern
+    # Konvertiert Tensor Batch zu PIL Liste
     batch_count = image.size(0) if len(image.shape) > 3 else 1
     if batch_count > 1:
         out = []
@@ -213,7 +212,7 @@ def tensor2pil(image):
     return [Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))]
 
 def pil2tensor(image):
-    # Konvertiert PIL Bilder zurück in Tensoren
+    # Konvertiert PIL Liste zurück zu Tensor Batch
     if isinstance(image, list):
         out = []
         for img in image:
@@ -231,7 +230,7 @@ class Standalone_OverlayTransparentImage:
         return {"required": {
                 "back_image": ("IMAGE",),
                 "overlay_image": ("IMAGE",),
-                "transparency": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1}),
+                "transparency": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "offset_x": ("INT", {"default": 0, "min": -4096, "max": 4096}),
                 "offset_y": ("INT", {"default": 0, "min": -4096, "max": 4096}),
                 "rotation_angle": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.1}),
@@ -252,62 +251,61 @@ class Standalone_OverlayTransparentImage:
         
         results = []
 
-        # Iteriere über die Hintergrund-Bilder (unterstützt Batch/Video)
+        # Iteriere über die Hintergrund-Bilder (Batch/Video Support)
         for i, bg_img in enumerate(back_images_pil):
             
-            # Wähle das passende Overlay Bild. 
-            # Wenn Overlay weniger Frames hat als Hintergrund, wird das letzte wiederholt (oder Modulo, hier: wiederholen des ersten, wenn nur 1)
+            # Wähle das passende Overlay Bild (loopen, falls weniger Overlays als Hintergründe)
             if i < len(overlay_images_pil):
                 ov_img = overlay_images_pil[i]
             else:
-                # Fallback: Nimm das letzte verfügbare Overlay oder das erste, wenn es nur eins ist
                 ov_img = overlay_images_pil[-1] if len(overlay_images_pil) > 0 else overlay_images_pil[0]
 
-            # --- Original Logik Start ---
-            
-            # Kopie erstellen, damit wir das Original im Cache nicht verändern
+            # Arbeitskopien erstellen
             current_overlay = ov_img.copy()
             current_bg = bg_img.copy()
 
-            # Apply transparency to overlay image
+            # 1. Overlay immer in RGBA wandeln für korrekte Alpha-Verarbeitung
             if current_overlay.mode != 'RGBA':
                 current_overlay = current_overlay.convert('RGBA')
-            
-            # Transparenz setzen
-            alpha = current_overlay.split()[3]
-            alpha = ImageOps.scale(alpha, 1, int(255 * (1 - transparency)))
-            current_overlay.putalpha(alpha)
 
-            # Rotate overlay image
-            current_overlay = current_overlay.rotate(rotation_angle, expand=True)
+            # 2. Transparenz anwenden (FIX: Werte ändern, nicht Größe)
+            if transparency > 0.0:
+                # Hole den Alpha-Kanal
+                alpha = current_overlay.split()[3]
+                # Berechne Faktor (0.0 = transparent, 1.0 = deckend)
+                factor = 1.0 - transparency
+                # Multipliziere jeden Pixel im Alpha-Kanal mit dem Faktor
+                alpha = alpha.point(lambda p: int(p * factor))
+                # Setze den modifizierten Alpha-Kanal zurück ins Bild
+                current_overlay.putalpha(alpha)
 
-            # Scale overlay image
-            overlay_width, overlay_height = current_overlay.size
-            new_size = (int(overlay_width * overlay_scale_factor), int(overlay_height * overlay_scale_factor))
-            
-            # Sicherheitscheck, falls size 0 wird
-            if new_size[0] > 0 and new_size[1] > 0:
-                current_overlay = current_overlay.resize(new_size, Image.Resampling.LANCZOS)
+            # 3. Rotation
+            if rotation_angle != 0:
+                current_overlay = current_overlay.rotate(rotation_angle, expand=True)
 
-            # Calculate centered position relative to the center of the background image
+            # 4. Skalierung
+            if overlay_scale_factor != 1.0:
+                overlay_width, overlay_height = current_overlay.size
+                new_size = (int(overlay_width * overlay_scale_factor), int(overlay_height * overlay_scale_factor))
+                if new_size[0] > 0 and new_size[1] > 0:
+                    current_overlay = current_overlay.resize(new_size, Image.Resampling.LANCZOS)
+
+            # 5. Positionierung (zentriert + offset)
             center_x = current_bg.width // 2
             center_y = current_bg.height // 2
             position_x = center_x - current_overlay.width // 2 + offset_x
             position_y = center_y - current_overlay.height // 2 + offset_y
 
-            # Paste the rotated overlay image onto the back image
-            # Wir konvertieren Hintergrund zu RGBA für das Pasting, falls er es nicht ist
+            # 6. Einfügen (Pasting)
+            # Hintergrund temporär zu RGBA, damit Alpha-Blending sauber funktioniert
             if current_bg.mode != 'RGBA':
                 current_bg = current_bg.convert('RGBA')
                 
-            current_bg.paste(current_overlay, (position_x, position_y), current_overlay)
+            # Paste overlay: Nutzt den Alpha-Kanal des Overlays als Maske für weiches Blending
+            current_bg.paste(current_overlay, (position_x, position_y), mask=current_overlay)
             
-            # Zurück zu RGB für den Output (optional, aber meist erwartet)
-            current_bg = current_bg.convert('RGB')
-            
-            # --- Original Logik Ende ---
-            
-            results.append(current_bg)
+            # Ergebnis zurück zu RGB konvertieren
+            results.append(current_bg.convert('RGB'))
 
         # Liste von PIL Bildern zurück zu Tensor Batch
         return (pil2tensor(results),)
@@ -362,6 +360,17 @@ class Standalone_SaveImageClean:
 
         return { "ui": { "images": results } }
 
+# --- MAPPINGS ---
+
+NODE_CLASS_MAPPINGS = {
+    "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
+    "Standalone_SaveImageClean": Standalone_SaveImageClean
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Standalone_OverlayTransparentImage": "Overlay Image (Video Supported)",
+    "Standalone_SaveImageClean": "Save Image (No Metadata)"
+}
 
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
