@@ -361,25 +361,59 @@ class Standalone_SaveImageClean:
         return { "ui": { "images": results } }
 
 # --- MAPPINGS ---
+import torch
 
-NODE_CLASS_MAPPINGS = {
-    "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
-    "Standalone_SaveImageClean": Standalone_SaveImageClean
-}
+class VAEDtypeChecker:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": ("VAE",),
+            },
+        }
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "Standalone_OverlayTransparentImage": "Overlay Image (Video Supported)",
-    "Standalone_SaveImageClean": "Save Image (No Metadata)"
-}
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("dtype_text", "device_text")
+    FUNCTION = "check_vae"
+    CATEGORY = "utils"
+
+    def check_vae(self, vae):
+        # Wir erstellen ein minimales Testbild (1x1 Pixel), um die VAE zu triggern
+        test_image = torch.zeros((1, 64, 64, 3))
+        
+        try:
+            # Wir kodieren das Bild, um zu sehen, welchen Datentyp die VAE ausgibt
+            latent_test = vae.encode(test_image)
+            
+            # In ComfyUI geben VAEs oft direkt den Tensor oder ein Dict zurück
+            if isinstance(latent_test, dict):
+                dtype = latent_test["samples"].dtype
+                device = latent_test["samples"].device
+            else:
+                dtype = latent_test.dtype
+                device = latent_test.device
+                
+            dtype_str = str(dtype)
+            device_str = str(device)
+            
+        except Exception as e:
+            dtype_str = f"Fehler beim Auslesen: {str(e)}"
+            device_str = "unbekannt"
+
+        print(f"VAE Check - Dtype: {dtype_str}, Device: {device_str}")
+        return (dtype_str, device_str)
+
 
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
      "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
     "Standalone_SaveImageClean": Standalone_SaveImageClean,
+    "VAEDtypeChecker": VAEDtypeChecker,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RVC_Terminal_Node": "RVC Terminal (Fixed Paths)",
     "Standalone_OverlayTransparentImage": "Overlay Image (Video Supported)",
     "Standalone_SaveImageClean": "Save Image (No Metadata)",
+    "VAEDtypeChecker": "VAE Dtype Checker",
 }
