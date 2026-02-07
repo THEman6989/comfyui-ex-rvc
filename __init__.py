@@ -404,11 +404,99 @@ class VAEDtypeChecker:
         return (dtype_str, device_str)
 
 
+class WanVideoSeamBlender:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "base_images": ("IMAGE",),       # Der erste Clip
+                "overlap_images": ("IMAGE",),    # Der zweite Clip (mit dem Overlap am Anfang)
+                "overlap_length": ("INT", {"default": 5, "min": 1, "max": 100, "step": 1}),
+                "interpolation": (["linear", "sigmoid"], {"default": "linear"}), # Linear oder weicher Kurvenverlauf
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("joined_images",)
+    FUNCTION = "blend_video_seams"
+    CATEGORY = "Amin/Video"
+
+    def blend_video_seams(self, base_images, overlap_images, overlap_length, interpolation):
+        # Sicherheitscheck: Batch-Größe prüfen
+        frames_base = base_images.shape[0]
+        frames_overlap = overlap_images.shape[0]
+
+        # Falls der Overlap größer als die Videos ist, korrigieren wir das
+        actual_overlap = min(overlap_length, frames_base, frames_overlap)
+        
+        if actual_overlap == 0:
+            # Einfach aneinanderhängen wenn kein Overlap
+            return (torch.cat((base_images, overlap_images), dim=0),)
+
+        # 1. Teile definieren, die NICHT angefasst werden
+        # Alles vom ersten Video AUSSER den letzten 'overlap' Frames
+        part_1_clean = base_images[:-actual_overlap]
+        
+        # Alles vom zweiten Video AUSSER den ersten 'overlap' Frames
+        part_3_clean = overlap_images[actual_overlap:]
+
+        # 2. Die Bereiche holen, die gemischt werden sollen
+        # Letzte X Frames von Base
+        blend_chunk_base = base_images[-actual_overlap:]
+        # Erste X Frames von Overlap
+        blend_chunk_new = overlap_images[:actual_overlap]
+
+        # 3. Blending Berechnung
+        blended_frames = []
+        
+        for i in range(actual_overlap):
+            # Berechne den Fortschritt (Alpha) von 0.0 bis 1.0
+            # Bei Linear und overlap 5: ca. 0.16, 0.33, 0.5, 0.66, 0.83
+            progress = (i + 1) / (actual_overlap + 1)
+
+            if interpolation == "sigmoid":
+                # Weichere Kurve (S-Kurve), damit der Übergang nicht so hart startet/endet
+                # Einfache Sigmoid-Annäherung: 3x^2 - 2x^3 (Smoothstep)
+                alpha = progress * progress * (3 - 2 * progress)
+            else:
+                # Linear
+                alpha = progress
+
+            # Mischen: (Base * (1-alpha)) + (New * alpha)
+            # Wir nutzen torch.lerp für effizientes Mischen auf der GPU/CPU
+            frame_base = blend_chunk_base[i]
+            frame_new = blend_chunk_new[i]
+            
+            # Formel: input + weight * (end - input) -> Base + alpha * (New - Base)
+            blended_frame = torch.lerp(frame_base, frame_new, alpha)
+            
+            # Dimension (1, H, W, C) für das Zusammenfügen wiederherstellen
+            blended_frames.append(blended_frame.unsqueeze(0))
+
+        # Liste der geblendeten Frames in einen Tensor umwandeln
+        part_2_blended = torch.cat(blended_frames, dim=0)
+
+        # 4. Alles zusammenfügen
+        # Wenn part_1_clean leer ist (z.B. wenn Video kürzer als Overlap war), beachten
+        parts = []
+        if part_1_clean.shape[0] > 0:
+            parts.append(part_1_clean)
+        
+        parts.append(part_2_blended)
+        
+        if part_3_clean.shape[0] > 0:
+            parts.append(part_3_clean)
+
+        result = torch.cat(parts, dim=0)
+
+        return (result,)
+
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
      "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
     "Standalone_SaveImageClean": Standalone_SaveImageClean,
     "VAEDtypeChecker": VAEDtypeChecker,
+    "WanVideoSeamBlender": WanVideoSeamBlender,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -416,4 +504,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Standalone_OverlayTransparentImage": "Overlay Image (Video Supported)",
     "Standalone_SaveImageClean": "Save Image (No Metadata)",
     "VAEDtypeChecker": "VAE Dtype Checker",
+    "WanVideoSeamBlender": "Wan Video Seam Blender",
 }
