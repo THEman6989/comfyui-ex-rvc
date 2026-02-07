@@ -491,12 +491,115 @@ class WanVideoSeamBlender:
 
         return (result,)
 
+
+class WanVideoSeamCC:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "base_images": ("IMAGE",),       # Clip A (wird am Ende gekürzt)
+                "overlap_images": ("IMAGE",),    # Clip B (wird am Anfang farbkorrigiert)
+                "overlap_length": ("INT", {"default": 5, "min": 0, "max": 100, "step": 1}),
+                "method": (["mkl", "hm", "reinhard", "mvgd"], {"default": "mkl"}),
+                "match_strength_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "match_strength_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "interpolation": (["linear", "sigmoid"], {"default": "linear"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("joined_video",)
+    FUNCTION = "join_with_cc"
+    CATEGORY = "Amin/Video"
+
+    def join_with_cc(self, base_images, overlap_images, overlap_length, method, match_strength_start, match_strength_end, interpolation):
+        try:
+            from color_matcher import ColorMatcher
+        except ImportError:
+            print("WanSeamCC: 'color_matcher' fehlt. Bitte installieren.")
+            # Fallback: Einfach hart zusammenfügen
+            return (torch.cat((base_images, overlap_images), dim=0),)
+
+        # 1. Berechne den tatsächlichen Overlap
+        frames_base = base_images.shape[0]
+        frames_new = overlap_images.shape[0]
+        actual_overlap = min(overlap_length, frames_base, frames_new)
+
+        if actual_overlap == 0:
+            # Kein Overlap -> Einfach aneinanderhängen
+            return (torch.cat((base_images, overlap_images), dim=0),)
+
+        # 2. Videos zerlegen
+        # ALTES VIDEO: Wir behalten alles BIS auf die letzten 'overlap' Frames
+        # Die letzten Frames dienen nur als Farbreferenz und werden dann "weggeworfen"
+        part_1_clean = base_images[:-actual_overlap] 
+        ref_chunk = base_images[-actual_overlap:]    # Die "weggeworfenen" Frames (Referenz)
+
+        # NEUES VIDEO: Wir trennen den Overlap-Teil ab, um ihn zu bearbeiten
+        target_chunk = overlap_images[:actual_overlap].clone() # Wird korrigiert
+        part_2_clean = overlap_images[actual_overlap:]         # Der Rest bleibt original
+
+        # 3. Color Matching Loop für den Overlap-Teil
+        cm = ColorMatcher()
+        print(f"WanSeamCC: Verbinde Videos mit {actual_overlap} Frames Overlap-Korrektur.")
+
+        for i in range(actual_overlap):
+            # Ramp Berechnung
+            if actual_overlap > 1:
+                raw_progress = i / (actual_overlap - 1)
+            else:
+                raw_progress = 0.0
+
+            if interpolation == "sigmoid":
+                progress = raw_progress * raw_progress * (3 - 2 * raw_progress)
+            else:
+                progress = raw_progress
+
+            # Stärke interpolieren
+            current_strength = (1.0 - progress) * match_strength_start + progress * match_strength_end
+
+            if current_strength <= 0.001:
+                continue
+
+            # 1:1 Matching (Frame i von Neu auf Frame i von Alt-Referenz)
+            src_img = target_chunk[i].cpu().numpy()
+            ref_img = ref_chunk[i].cpu().numpy()
+
+            try:
+                matched_data = cm.transfer(src=src_img, ref=ref_img, method=method)
+                matched_tensor = torch.from_numpy(matched_data).to(target_chunk.device)
+                
+                # Mischen
+                target_chunk[i] = torch.lerp(target_chunk[i], matched_tensor, current_strength)
+            
+            except Exception as e:
+                print(f"Fehler Frame {i}: {e}")
+
+        # 4. Alles zusammenfügen (Concatenate)
+        # [Altes Video Clean] + [Korrigierter Overlap] + [Neues Video Rest]
+        
+        parts = []
+        if part_1_clean.shape[0] > 0:
+            parts.append(part_1_clean)
+        
+        parts.append(target_chunk)
+        
+        if part_2_clean.shape[0] > 0:
+            parts.append(part_2_clean)
+
+        result = torch.cat(parts, dim=0)
+
+        return (result,)
+
+
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
      "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
     "Standalone_SaveImageClean": Standalone_SaveImageClean,
     "VAEDtypeChecker": VAEDtypeChecker,
     "WanVideoSeamBlender": WanVideoSeamBlender,
+    "WanVideoSeamCC": WanVideoSeamCC,
+    
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -505,4 +608,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Standalone_SaveImageClean": "Save Image (No Metadata)",
     "VAEDtypeChecker": "VAE Dtype Checker",
     "WanVideoSeamBlender": "Wan Video Seam Blender",
+    "WanVideoSeamCC": "Wan Video Seam (Color Correct & Join)",
 }
