@@ -691,6 +691,131 @@ class WanVideoSeamCC_v2:
         return (result,)
 
 
+import torch
+
+class VRAM_Video_Context_Batcher:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "images": ("IMAGE",),
+            "masks": ("MASK",),
+            "start_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1}),
+            "end_frame": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1}), # 0 = bis zum Ende des Videos
+            "chunk_size": ("INT", {"default": 100, "min": 10, "max": 1000, "step": 1}), # Wie viele Frames MAXIMAL auf einmal (VRAM Limit)
+            "context_length": ("INT", {"default": 10, "min": 0, "max": 100, "step": 1}), # Die 10 "alten" Frames
+        }}
+
+    # Wir geben Listen zurück, damit ComfyUI automatisch nacheinander loopt!
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT")
+    RETURN_NAMES = ("image_chunks", "mask_chunks", "active_starts", "active_ends", "context_starts")
+    OUTPUT_IS_LIST = (True, True, True, True, True)
+    FUNCTION = "batch_video"
+    CATEGORY = "Amin/Video"
+
+    def batch_video(self, images, masks, start_frame, end_frame, chunk_size, context_length):
+        total_frames = images.shape[0]
+        if end_frame == 0 or end_frame > total_frames:
+            end_frame = total_frames
+
+        # Falls die Maske kürzer ist als das Video, mit Nullen (Schwarz) auffüllen
+        if masks.shape[0] < total_frames:
+            padding = torch.zeros((total_frames - masks.shape[0], masks.shape[1], masks.shape[2]))
+            masks = torch.cat([masks, padding], dim=0)
+
+        active_start = start_frame
+        active_end = end_frame
+
+        out_images, out_masks = [], []
+        out_active_starts, out_active_ends, out_context_starts = [], [], []
+
+        # Wie viele Frames WIRKLICH neu bearbeitet werden (z.B. 100 - 10 = 90 neue Frames)
+        process_length = chunk_size - context_length
+        if process_length <= 0:
+            raise ValueError("chunk_size muss größer sein als context_length!")
+
+        current = active_start
+
+        while current < active_end:
+            current_end = min(current + process_length, active_end)
+
+            # 1. Kontext davor berechnen (Die "10 alten" Bilder)
+            context_start = max(0, current - context_length)
+            actual_context_len = current - context_start
+
+            # 2. Kontext danach (Nur beim allerletzten Abschnitt nochmal "10 plus", wie gewünscht)
+            is_last = current_end == active_end
+            post_context_len = context_length if is_last else 0
+            post_context_end = min(total_frames, current_end + post_context_len)
+
+            # --- BILDER ZUSAMMENSTELLEN ---
+            # Dieser Chunk enthält: [Alte Frames] + [Neue Frames] + [Evtl. Frames am Ende]
+            chunk_img = images[context_start:post_context_end]
+
+            # --- MASKE BAUEN ---
+            # Alte Frames kriegen KEINE Maske (Schwarz/0), damit das Model sie nur als Kontext nutzt
+            mask_before = torch.zeros((actual_context_len, masks.shape[1], masks.shape[2]))
+            # Neue Frames behalten die originale Maske
+            mask_active = masks[current:current_end]
+            # Extra Frames am Ende kriegen auch KEINE Maske
+            mask_after = torch.zeros((post_context_end - current_end, masks.shape[1], masks.shape[2]))
+
+            chunk_mask = torch.cat([mask_before, mask_active, mask_after], dim=0)
+
+            # In die Liste packen
+            out_images.append(chunk_img)
+            out_masks.append(chunk_mask)
+            
+            # Positionen für den Merger speichern
+            out_active_starts.append(current)
+            out_active_ends.append(current_end)
+            out_context_starts.append(context_start)
+
+            current = current_end
+
+        return (out_images, out_masks, out_active_starts, out_active_ends, out_context_starts)
+
+class VRAM_Video_Context_Merger:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "original_images": ("IMAGE",),
+            "processed_chunks": ("IMAGE",), # Kommt als Liste aus dem KSampler
+            "active_starts": ("INT",),
+            "active_ends": ("INT",),
+            "context_starts": ("INT",),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("final_video",)
+    # WICHTIG: Erlaubt ComfyUI die Einzelausführungen wieder als Liste zu sammeln!
+    INPUT_IS_LIST = (False, True, True, True, True) 
+    FUNCTION = "merge_video"
+    CATEGORY = "Amin/Video"
+
+    def merge_video(self, original_images, processed_chunks, active_starts, active_ends, context_starts):
+        # Kopie des Originalvideos erstellen
+        final_video = original_images.clone()
+
+        # Alle nacheinander abgearbeiteten Chunks wieder einfügen
+        for i in range(len(processed_chunks)):
+            chunk = processed_chunks[i]
+            a_start = active_starts[i]
+            a_end = active_ends[i]
+            c_start = context_starts[i]
+
+            # Herausfinden, wo in diesem Chunk die tatsächlichen "neuen" Frames anfangen
+            # (Wir müssen die 10 Frames Kontext ja wieder abschneiden, da sie sich nicht verändert haben sollten)
+            context_offset = a_start - c_start
+            active_length = a_end - a_start
+
+            # Extrahiere NUR die neu generierten Bilder (ohne den Kontext davor/danach)
+            edited_frames = chunk[context_offset : context_offset + active_length]
+
+            # Füge sie exakt an ihren Platz im großen Video ein
+            final_video[a_start:a_end] = edited_frames
+
+        return (final_video,)
+
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
      "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
@@ -699,6 +824,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSeamBlender": WanVideoSeamBlender,
     "WanVideoSeamCC": WanVideoSeamCC,
     "WanVideoSeamCC_v2": WanVideoSeamCC_v2,
+    "VRAM_Video_Context_Batcher": VRAM_Video_Context_Batcher,
+    "VRAM_Video_Context_Merger": VRAM_Video_Context_Merger,
     
     
 }
@@ -711,4 +838,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSeamBlender": "Wan Video Seam Blender",
     "WanVideoSeamCC": "Wan Video Seam (Color Correct & Join)",
     "WanVideoSeamCC_v2": "Wan Video Seam v2 (Correct Base)",
+    "VRAM_Video_Context_Batcher": "Wan Video VRAM Batcher (Split)",
+    "VRAM_Video_Context_Merger": "Wan Video VRAM Merger (Join)",
 }
