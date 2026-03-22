@@ -816,6 +816,61 @@ class VRAM_Video_Context_Merger:
 
         return (final_video,)
 
+
+import os
+import numpy as np
+from PIL import Image
+import folder_paths
+
+class ExactImageSaver:
+    def __init__(self):
+        # Standard-Output-Ordner von ComfyUI
+        self.output_dir = folder_paths.get_output_directory()
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", ),
+                "exact_file_path": ("STRING", {"default": "scaled_black/big_body6645757_00001_1"}),
+                "extension": (["png", "jpg", "webp"], {"default": "png"}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_exact_image"
+    OUTPUT_NODE = True
+    CATEGORY = "image"
+
+    def save_exact_image(self, images, exact_file_path, extension):
+        # Prüfen, ob der Nutzer einen absoluten Pfad (z.B. C:/Bilder/...) oder einen relativen eingegeben hat
+        if os.path.isabs(exact_file_path):
+            full_path_without_ext = exact_file_path
+        else:
+            # Wenn relativ, speichere es relativ zum ComfyUI "output" Ordner
+            full_path_without_ext = os.path.join(self.output_dir, exact_file_path)
+            
+        # Automatisch alle benötigten Unterordner (z.B. "scaled_black") erstellen
+        os.makedirs(os.path.dirname(full_path_without_ext), exist_ok=True)
+
+        # Bilder aus dem Batch verarbeiten
+        for batch_number, image in enumerate(images):
+            # ComfyUI Image Tensor zu PIL Image konvertieren
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            
+            # Bei nur einem Bild: Exakter Name. Bei einem Batch > 1: Index anhängen, um Fehler zu vermeiden.
+            if len(images) > 1:
+                final_path = f"{full_path_without_ext}_{batch_number}.{extension}"
+            else:
+                final_path = f"{full_path_without_ext}.{extension}"
+            
+            # Bild speichern (überschreibt automatisch vorhandene Dateien mit gleichem Namen)
+            img.save(final_path)
+
+        return ()
+
+
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
      "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
@@ -826,6 +881,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSeamCC_v2": WanVideoSeamCC_v2,
     "VRAM_Video_Context_Batcher": VRAM_Video_Context_Batcher,
     "VRAM_Video_Context_Merger": VRAM_Video_Context_Merger,
+    "ExactImageSaver": ExactImageSaver.
     
     
 }
@@ -840,4 +896,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSeamCC_v2": "Wan Video Seam v2 (Correct Base)",
     "VRAM_Video_Context_Batcher": "Wan Video VRAM Batcher (Split)",
     "VRAM_Video_Context_Merger": "Wan Video VRAM Merger (Join)",
+    "ExactImageSaver": "💾 Save Image (Exact Name & Overwrite)",
 }
