@@ -870,6 +870,42 @@ class ExactImageSaver:
 
         return ()
 
+class RawBatchFrameSelector:
+    """
+    Extrahiert einen spezifischen Frame aus einem Batch, 
+    OHNE die unformatierten Tensor-Werte (RAW) zu verändern oder zu beschränken.
+    Ideal für Depth/Mesh-Daten, die nicht zwischen 0.0 und 1.0 liegen.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Der Batch an RAW-Daten/Bildern."}),
+                "frame_index": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1, "tooltip": "Der Index des gewünschten Frames (z.B. 0 für den ersten, 75 für den 76.)."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("raw_frame",)
+    FUNCTION = "extract_frame"
+    CATEGORY = "DepthAnythingV3/utils" # Du kannst die Kategorie anpassen
+
+    def extract_frame(self, images, frame_index):
+        # 'images' ist ein PyTorch Tensor, typischerweise mit der Form [Batch, Höhe, Breite, Kanäle]
+        batch_size = images.shape[0]
+
+        if batch_size == 0:
+            return (images,)
+
+        # Sicherstellen, dass der Index nicht außerhalb des Batches liegt
+        index = min(frame_index, batch_size - 1)
+
+        # PyTorch Slicing: [index:index+1] hält die Batch-Dimension (Ausgabe ist [1, H, W, C])
+        # WICHTIG: Hier findet keinerlei Normalisierung, Clamp oder Formatierung statt.
+        # Die rohen Float-Werte bleiben exakt so, wie sie von Depth Anything V3 ausgegeben wurden.
+        selected_frame = images[index:index+1]
+
+        return (selected_frame,)
 
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
@@ -881,7 +917,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSeamCC_v2": WanVideoSeamCC_v2,
     "VRAM_Video_Context_Batcher": VRAM_Video_Context_Batcher,
     "VRAM_Video_Context_Merger": VRAM_Video_Context_Merger,
-    "ExactImageSaver": ExactImageSaver.
+    "ExactImageSaver": ExactImageSaver,
+    "RawBatchFrameSelector": RawBatchFrameSelector,
     
     
 }
@@ -897,4 +934,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VRAM_Video_Context_Batcher": "Wan Video VRAM Batcher (Split)",
     "VRAM_Video_Context_Merger": "Wan Video VRAM Merger (Join)",
     "ExactImageSaver": "💾 Save Image (Exact Name & Overwrite)",
+    "RawBatchFrameSelector": "RAW Frame Selector (Preserve Tensor)",
 }
