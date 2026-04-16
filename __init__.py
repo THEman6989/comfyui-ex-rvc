@@ -6,6 +6,61 @@ import tempfile
 import shutil
 import folder_paths
 
+
+
+# ======================================================================
+# KUBUNTU AUTO-STAY-AWAKE SCRIPT (Hintergrund-Wächter)
+# ======================================================================
+import threading
+import time
+import subprocess
+import server
+import atexit
+
+_kubuntu_inhibit_proc = None
+
+def _kubuntu_stop_inhibit():
+    """Sicherheitsnetz beim Beenden von ComfyUI"""
+    global _kubuntu_inhibit_proc
+    if _kubuntu_inhibit_proc is not None:
+        _kubuntu_inhibit_proc.terminate()
+        _kubuntu_inhibit_proc = None
+
+atexit.register(_kubuntu_stop_inhibit)
+
+def _kubuntu_monitor_queue():
+    global _kubuntu_inhibit_proc
+    
+    # Warten, bis der Server da ist
+    while not hasattr(server, 'PromptServer') or getattr(server, 'PromptServer').instance is None:
+        time.sleep(2)
+        
+    prompt_server = getattr(server, 'PromptServer').instance
+    
+    while True:
+        try:
+            running, pending = prompt_server.prompt_queue.get_current_queue()
+            if (len(running) + len(pending)) > 0:
+                if _kubuntu_inhibit_proc is None:
+                    _kubuntu_inhibit_proc = subprocess.Popen(
+                        ["systemd-inhibit", "--what=idle:sleep", "--who=ComfyUI", "--why=Queue_Active", "sleep", "infinity"]
+                    )
+                    print("\n>>> [Kubuntu Auto-Guard] Queue läuft! PC bleibt wach. 🛡️")
+            else:
+                if _kubuntu_inhibit_proc is not None:
+                    _kubuntu_inhibit_proc.terminate()
+                    _kubuntu_inhibit_proc = None
+                    print("\n>>> [Kubuntu Auto-Guard] Queue leer. PC darf schlafen. 😴")
+        except Exception:
+            pass 
+            
+        time.sleep(3)
+
+# Startet den Überwacher
+threading.Thread(target=_kubuntu_monitor_queue, daemon=True).start()
+# ======================================================================
+
+
 class RVC_Terminal_Node:
     def __init__(self):
         pass
@@ -906,6 +961,9 @@ class RawBatchFrameSelector:
         selected_frame = images[index:index+1]
 
         return (selected_frame,)
+
+
+
 
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
