@@ -9,55 +9,183 @@ import folder_paths
 
 
 # ======================================================================
-# KUBUNTU AUTO-STAY-AWAKE SCRIPT (Hintergrund-Wächter)
+# COMFYUI AUTO-STAY-AWAKE GUARD
+# CachyOS / Hyprland / KDE kompatibel
 # ======================================================================
 import threading
 import time
-import subprocess
-import server
 import atexit
+import shutil as _shutil
+import server
 
-_kubuntu_inhibit_proc = None
+_auto_guard_proc = None
+_auto_guard_backend = None
 
-def _kubuntu_stop_inhibit():
-    """Sicherheitsnetz beim Beenden von ComfyUI"""
-    global _kubuntu_inhibit_proc
-    if _kubuntu_inhibit_proc is not None:
-        _kubuntu_inhibit_proc.terminate()
-        _kubuntu_inhibit_proc = None
 
-atexit.register(_kubuntu_stop_inhibit)
+def _run_quiet(cmd):
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        return None
 
-def _kubuntu_monitor_queue():
-    global _kubuntu_inhibit_proc
-    
-    # Warten, bis der Server da ist
-    while not hasattr(server, 'PromptServer') or getattr(server, 'PromptServer').instance is None:
+
+def _is_hyprland():
+    desktop = (
+        os.environ.get("XDG_CURRENT_DESKTOP", "")
+        + " "
+        + os.environ.get("DESKTOP_SESSION", "")
+    ).lower()
+    return "hyprland" in desktop or bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
+
+
+def _hypridle_running():
+    if not _shutil.which("pgrep"):
+        return False
+    result = _run_quiet(["pgrep", "-x", "hypridle"])
+    return result is not None and result.returncode == 0
+
+
+def _start_systemd_inhibit():
+    if not _shutil.which("systemd-inhibit"):
+        return None
+
+    try:
+        proc = subprocess.Popen(
+            [
+                "systemd-inhibit",
+                "--what=idle:sleep",
+                "--mode=block",
+                "--who=ComfyUI",
+                "--why=ComfyUI queue active",
+                "sleep",
+                "infinity",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Kurz warten: Wenn Polkit meckert, stirbt der Prozess sofort.
+        time.sleep(0.5)
+
+        if proc.poll() is not None:
+            err = ""
+            try:
+                err = proc.stderr.read().strip() if proc.stderr else ""
+            except Exception:
+                pass
+
+            if err:
+                print(f"\n>>> [ComfyUI Auto-Guard] systemd-inhibit nicht nutzbar: {err}")
+            return None
+
+        return proc
+
+    except Exception as e:
+        print(f"\n>>> [ComfyUI Auto-Guard] systemd-inhibit Fehler: {e}")
+        return None
+
+
+def _heartbeat_keep_awake():
+    """
+    Fallback: hält Display/Idle aktiv.
+    Verhindert Sleep nicht auf jedem Desktop zu 100%, hilft aber ohne Polkit.
+    """
+    if _is_hyprland() and _shutil.which("hyprctl"):
+        _run_quiet(["hyprctl", "dispatch", "dpms", "on"])
+
+    if _shutil.which("xdg-screensaver"):
+        _run_quiet(["xdg-screensaver", "reset"])
+
+    if os.environ.get("DISPLAY") and _shutil.which("xset"):
+        _run_quiet(["xset", "s", "reset"])
+
+
+def _start_auto_guard():
+    global _auto_guard_proc, _auto_guard_backend
+
+    if _auto_guard_backend is not None:
+        return
+
+    # CachyOS/Hyprland: hypridle ist meist der eigentliche Sleep-/Idle-Trigger.
+    # Das braucht keine Polkit-Authentifizierung.
+    if _is_hyprland() and _shutil.which("pkill") and _hypridle_running():
+        result = _run_quiet(["pkill", "-STOP", "-x", "hypridle"])
+        if result is not None and result.returncode == 0:
+            _auto_guard_backend = "hypridle"
+            print("\n>>> [ComfyUI Auto-Guard] Queue läuft! Hyprland/hypridle pausiert. 🛡️")
+            return
+
+    # Normaler Linux-Desktop-Fall.
+    proc = _start_systemd_inhibit()
+    if proc is not None:
+        _auto_guard_proc = proc
+        _auto_guard_backend = "systemd-inhibit"
+        print("\n>>> [ComfyUI Auto-Guard] Queue läuft! PC bleibt wach. 🛡️")
+        return
+
+    # Letzter Fallback ohne Auth.
+    _auto_guard_backend = "heartbeat"
+    print("\n>>> [ComfyUI Auto-Guard] Queue läuft! Nutze Heartbeat-Fallback. 🛡️")
+
+
+def _stop_auto_guard():
+    global _auto_guard_proc, _auto_guard_backend
+
+    if _auto_guard_backend == "hypridle":
+        if _shutil.which("pkill"):
+            _run_quiet(["pkill", "-CONT", "-x", "hypridle"])
+        print("\n>>> [ComfyUI Auto-Guard] Queue leer. hypridle wieder aktiv. 😴")
+
+    elif _auto_guard_proc is not None:
+        try:
+            _auto_guard_proc.terminate()
+            _auto_guard_proc.wait(timeout=2)
+        except Exception:
+            try:
+                _auto_guard_proc.kill()
+            except Exception:
+                pass
+        print("\n>>> [ComfyUI Auto-Guard] Queue leer. PC darf schlafen. 😴")
+
+    elif _auto_guard_backend == "heartbeat":
+        print("\n>>> [ComfyUI Auto-Guard] Queue leer. Heartbeat beendet. 😴")
+
+    _auto_guard_proc = None
+    _auto_guard_backend = None
+
+
+def _monitor_comfy_queue():
+    while not hasattr(server, "PromptServer") or getattr(server, "PromptServer").instance is None:
         time.sleep(2)
-        
-    prompt_server = getattr(server, 'PromptServer').instance
-    
+
+    prompt_server = getattr(server, "PromptServer").instance
+
     while True:
         try:
             running, pending = prompt_server.prompt_queue.get_current_queue()
-            if (len(running) + len(pending)) > 0:
-                if _kubuntu_inhibit_proc is None:
-                    _kubuntu_inhibit_proc = subprocess.Popen(
-                        ["systemd-inhibit", "--what=idle:sleep", "--who=ComfyUI", "--why=Queue_Active", "sleep", "infinity"]
-                    )
-                    print("\n>>> [Kubuntu Auto-Guard] Queue läuft! PC bleibt wach. 🛡️")
+            queue_active = (len(running) + len(pending)) > 0
+
+            if queue_active:
+                _start_auto_guard()
+                _heartbeat_keep_awake()
             else:
-                if _kubuntu_inhibit_proc is not None:
-                    _kubuntu_inhibit_proc.terminate()
-                    _kubuntu_inhibit_proc = None
-                    print("\n>>> [Kubuntu Auto-Guard] Queue leer. PC darf schlafen. 😴")
-        except Exception:
-            pass 
-            
+                _stop_auto_guard()
+
+        except Exception as e:
+            print(f"\n>>> [ComfyUI Auto-Guard] Fehler im Queue-Monitor: {e}")
+
         time.sleep(3)
 
-# Startet den Überwacher
-threading.Thread(target=_kubuntu_monitor_queue, daemon=True).start()
+
+atexit.register(_stop_auto_guard)
+
+threading.Thread(target=_monitor_comfy_queue, daemon=True).start()
 # ======================================================================
 
 
