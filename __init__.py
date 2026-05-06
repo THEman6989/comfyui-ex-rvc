@@ -10,8 +10,10 @@ import folder_paths
 
 # ======================================================================
 # COMFYUI AUTO-STAY-AWAKE GUARD
-# CachyOS / Hyprland / KDE kompatibel
+# KDE Plasma / CachyOS kompatibel
 # ======================================================================
+import os
+import subprocess
 import threading
 import time
 import atexit
@@ -20,6 +22,7 @@ import server
 
 _auto_guard_proc = None
 _auto_guard_backend = None
+_auto_guard_kde_cookie = None
 
 
 def _run_quiet(cmd):
@@ -34,20 +37,95 @@ def _run_quiet(cmd):
         return None
 
 
-def _is_hyprland():
+def _is_kde_plasma():
     desktop = (
         os.environ.get("XDG_CURRENT_DESKTOP", "")
         + " "
         + os.environ.get("DESKTOP_SESSION", "")
     ).lower()
-    return "hyprland" in desktop or bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
+
+    return (
+        "kde" in desktop
+        or "plasma" in desktop
+        or os.environ.get("KDE_FULL_SESSION") == "true"
+    )
 
 
-def _hypridle_running():
-    if not _shutil.which("pgrep"):
+def _find_qdbus():
+    for cmd in ("qdbus6", "qdbus-qt6", "qdbus"):
+        if _shutil.which(cmd):
+            return cmd
+    return None
+
+
+def _start_kde_inhibit():
+    global _auto_guard_kde_cookie
+
+    qdbus = _find_qdbus()
+    if not qdbus:
+        print("\n>>> [ComfyUI Auto-Guard] qdbus nicht gefunden. Installiere: sudo pacman -S qt6-tools")
         return False
-    result = _run_quiet(["pgrep", "-x", "hypridle"])
-    return result is not None and result.returncode == 0
+
+    try:
+        result = subprocess.run(
+            [
+                qdbus,
+                "org.freedesktop.PowerManagement",
+                "/org/freedesktop/PowerManagement/Inhibit",
+                "org.freedesktop.PowerManagement.Inhibit.Inhibit",
+                "ComfyUI",
+                "ComfyUI queue active",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            print(f"\n>>> [ComfyUI Auto-Guard] KDE PowerDevil Inhibit fehlgeschlagen: {err}")
+            return False
+
+        cookie = result.stdout.strip()
+
+        if not cookie:
+            print("\n>>> [ComfyUI Auto-Guard] KDE PowerDevil gab keinen Cookie zurück.")
+            return False
+
+        _auto_guard_kde_cookie = cookie
+        return True
+
+    except Exception as e:
+        print(f"\n>>> [ComfyUI Auto-Guard] KDE PowerDevil Fehler: {e}")
+        return False
+
+
+def _stop_kde_inhibit():
+    global _auto_guard_kde_cookie
+
+    if _auto_guard_kde_cookie is None:
+        return
+
+    qdbus = _find_qdbus()
+    if qdbus:
+        try:
+            subprocess.run(
+                [
+                    qdbus,
+                    "org.freedesktop.PowerManagement",
+                    "/org/freedesktop/PowerManagement/Inhibit",
+                    "org.freedesktop.PowerManagement.Inhibit.UnInhibit",
+                    str(_auto_guard_kde_cookie),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    _auto_guard_kde_cookie = None
 
 
 def _start_systemd_inhibit():
@@ -70,7 +148,6 @@ def _start_systemd_inhibit():
             text=True,
         )
 
-        # Kurz warten: Wenn Polkit meckert, stirbt der Prozess sofort.
         time.sleep(0.5)
 
         if proc.poll() is not None:
@@ -82,6 +159,7 @@ def _start_systemd_inhibit():
 
             if err:
                 print(f"\n>>> [ComfyUI Auto-Guard] systemd-inhibit nicht nutzbar: {err}")
+
             return None
 
         return proc
@@ -92,13 +170,6 @@ def _start_systemd_inhibit():
 
 
 def _heartbeat_keep_awake():
-    """
-    Fallback: hält Display/Idle aktiv.
-    Verhindert Sleep nicht auf jedem Desktop zu 100%, hilft aber ohne Polkit.
-    """
-    if _is_hyprland() and _shutil.which("hyprctl"):
-        _run_quiet(["hyprctl", "dispatch", "dpms", "on"])
-
     if _shutil.which("xdg-screensaver"):
         _run_quiet(["xdg-screensaver", "reset"])
 
@@ -112,35 +183,28 @@ def _start_auto_guard():
     if _auto_guard_backend is not None:
         return
 
-    # CachyOS/Hyprland: hypridle ist meist der eigentliche Sleep-/Idle-Trigger.
-    # Das braucht keine Polkit-Authentifizierung.
-    if _is_hyprland() and _shutil.which("pkill") and _hypridle_running():
-        result = _run_quiet(["pkill", "-STOP", "-x", "hypridle"])
-        if result is not None and result.returncode == 0:
-            _auto_guard_backend = "hypridle"
-            print("\n>>> [ComfyUI Auto-Guard] Queue läuft! Hyprland/hypridle pausiert. 🛡️")
-            return
+    if _is_kde_plasma() and _start_kde_inhibit():
+        _auto_guard_backend = "kde-powerdevil"
+        print("\n>>> [ComfyUI Auto-Guard] Queue läuft! KDE PowerDevil blockiert Sleep. 🛡️")
+        return
 
-    # Normaler Linux-Desktop-Fall.
     proc = _start_systemd_inhibit()
     if proc is not None:
         _auto_guard_proc = proc
         _auto_guard_backend = "systemd-inhibit"
-        print("\n>>> [ComfyUI Auto-Guard] Queue läuft! PC bleibt wach. 🛡️")
+        print("\n>>> [ComfyUI Auto-Guard] Queue läuft! systemd-inhibit aktiv. 🛡️")
         return
 
-    # Letzter Fallback ohne Auth.
     _auto_guard_backend = "heartbeat"
-    print("\n>>> [ComfyUI Auto-Guard] Queue läuft! Nutze Heartbeat-Fallback. 🛡️")
+    print("\n>>> [ComfyUI Auto-Guard] Queue läuft! Heartbeat-Fallback aktiv. 🛡️")
 
 
 def _stop_auto_guard():
     global _auto_guard_proc, _auto_guard_backend
 
-    if _auto_guard_backend == "hypridle":
-        if _shutil.which("pkill"):
-            _run_quiet(["pkill", "-CONT", "-x", "hypridle"])
-        print("\n>>> [ComfyUI Auto-Guard] Queue leer. hypridle wieder aktiv. 😴")
+    if _auto_guard_backend == "kde-powerdevil":
+        _stop_kde_inhibit()
+        print("\n>>> [ComfyUI Auto-Guard] Queue leer. KDE PowerDevil-Inhibit beendet. 😴")
 
     elif _auto_guard_proc is not None:
         try:
@@ -151,7 +215,8 @@ def _stop_auto_guard():
                 _auto_guard_proc.kill()
             except Exception:
                 pass
-        print("\n>>> [ComfyUI Auto-Guard] Queue leer. PC darf schlafen. 😴")
+
+        print("\n>>> [ComfyUI Auto-Guard] Queue leer. systemd-inhibit beendet. 😴")
 
     elif _auto_guard_backend == "heartbeat":
         print("\n>>> [ComfyUI Auto-Guard] Queue leer. Heartbeat beendet. 😴")
@@ -187,7 +252,6 @@ atexit.register(_stop_auto_guard)
 
 threading.Thread(target=_monitor_comfy_queue, daemon=True).start()
 # ======================================================================
-
 
 class RVC_Terminal_Node:
     def __init__(self):
@@ -505,10 +569,12 @@ class Standalone_SaveImageClean:
 
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": 
-                    {"images": ("IMAGE", ),
-                     "filename_prefix": ("STRING", {"default": "clean_image"})},
-                }
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "clean_image"}),
+            },
+        }
 
     RETURN_TYPES = ()
     FUNCTION = "save_images_clean"
@@ -517,32 +583,39 @@ class Standalone_SaveImageClean:
 
     def save_images_clean(self, images, filename_prefix="clean_image"):
         filename_prefix += self.prefix_append
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
-        
-        results = list()
-        
-        # Konvertieren zu PIL
+
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix,
+            self.output_dir,
+            images[0].shape[1],
+            images[0].shape[0],
+        )
+
+        results = []
+
         pil_images = tensor2pil(images)
 
         for image in pil_images:
-            file = f"{filename}_{counter:05}_.png"
-            
-            # Ein neues Bild erstellen, um sicherzugehen, dass keine 'info' kopiert wird
+            file_name = f"{filename}_{counter:05}_.png"
+
             clean_image = Image.new(image.mode, image.size)
             clean_image.putdata(image.getdata())
-            
-            # Speichern ohne pnginfo Parameter -> Keine Metadaten
-            clean_image.save(os.path.join(full_output_folder, file), format="PNG", compress_level=4)
-            
+
+            clean_image.save(
+                os.path.join(full_output_folder, file_name),
+                format="PNG",
+                compress_level=4,
+            )
+
             results.append({
-                "filename": file,
+                "filename": file_name,
                 "subfolder": subfolder,
-                "type": self.type
+                "type": self.type,
             })
+
             counter += 1
 
-        return { "ui": { "images": results } }
-
+        return {"ui": {"images": results}}
 # --- MAPPINGS ---
 import torch
 
