@@ -6,6 +6,8 @@ import tempfile
 import shutil
 import folder_paths
 import hashlib
+import json
+import uuid
 from datetime import datetime, timezone
 from aiohttp import web
 
@@ -472,43 +474,83 @@ def pil2tensor(image):
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
 
 API_PUSH_IMAGE_DIR = os.path.join(folder_paths.get_input_directory(), "ex_rvc_api_push")
-API_PUSH_IMAGE_BASENAME = "latest_api_push"
+API_PUSH_IMAGE_PENDING_FILE = os.path.join(API_PUSH_IMAGE_DIR, "_pending.json")
 API_PUSH_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 API_PUSH_IMAGE_ROUTE = "/ex-rvc/api/pushed-image"
 os.makedirs(API_PUSH_IMAGE_DIR, exist_ok=True)
 
 
-def _api_push_image_path():
+def _safe_api_push_image_id(image_id):
+    image_id = (image_id or "").strip()
+    if not image_id:
+        return ""
+
+    keep = []
+    for char in image_id:
+        if char.isalnum() or char in ("-", "_"):
+            keep.append(char)
+
+    return "".join(keep)[:96]
+
+
+def _api_push_image_path(image_id):
+    image_id = _safe_api_push_image_id(image_id)
+    if not image_id:
+        return None
+
     for ext in API_PUSH_IMAGE_EXTENSIONS:
-        path = os.path.join(API_PUSH_IMAGE_DIR, API_PUSH_IMAGE_BASENAME + ext)
+        path = os.path.join(API_PUSH_IMAGE_DIR, image_id + ext)
         if os.path.exists(path):
             return path
     return None
 
 
+def _read_api_push_pending():
+    if not os.path.exists(API_PUSH_IMAGE_PENDING_FILE):
+        return None
+
+    try:
+        with open(API_PUSH_IMAGE_PENDING_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+
+    image_id = _safe_api_push_image_id(data.get("image_id"))
+    if not image_id or _api_push_image_path(image_id) is None:
+        return None
+
+    return image_id
+
+
+def _write_api_push_pending(image_id):
+    with open(API_PUSH_IMAGE_PENDING_FILE, "w", encoding="utf-8") as f:
+        json.dump({"image_id": image_id}, f)
+
+
+def _clear_api_push_pending():
+    if os.path.exists(API_PUSH_IMAGE_PENDING_FILE):
+        os.remove(API_PUSH_IMAGE_PENDING_FILE)
+        return True
+    return False
+
+
 def _api_push_image_status():
-    path = _api_push_image_path()
-    if path is None:
-        return {"available": False}
+    pending_image_id = _read_api_push_pending()
+    if pending_image_id is None:
+        return {"available": False, "pending": False}
+
+    path = _api_push_image_path(pending_image_id)
 
     stat = os.stat(path)
     return {
         "available": True,
+        "pending": True,
+        "image_id": pending_image_id,
         "filename": os.path.basename(path),
         "path": path,
         "size": stat.st_size,
         "updated_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
     }
-
-
-def _clear_api_push_image():
-    removed = False
-    for ext in API_PUSH_IMAGE_EXTENSIONS:
-        path = os.path.join(API_PUSH_IMAGE_DIR, API_PUSH_IMAGE_BASENAME + ext)
-        if os.path.exists(path):
-            os.remove(path)
-            removed = True
-    return removed
 
 
 def _extension_from_content_type(content_type):
@@ -531,8 +573,9 @@ def _save_api_push_image(data, ext):
         raise ValueError("No image data received.")
 
     ext = ext if ext in API_PUSH_IMAGE_EXTENSIONS else ".png"
+    image_id = uuid.uuid4().hex
 
-    target_path = os.path.join(API_PUSH_IMAGE_DIR, API_PUSH_IMAGE_BASENAME + ext)
+    target_path = os.path.join(API_PUSH_IMAGE_DIR, image_id + ext)
     tmp_path = target_path + ".tmp"
 
     with open(tmp_path, "wb") as f:
@@ -548,43 +591,58 @@ def _save_api_push_image(data, ext):
             pass
         raise ValueError(f"Invalid image data: {e}")
 
-    _clear_api_push_image()
     os.replace(tmp_path, target_path)
+    _write_api_push_pending(image_id)
     return _api_push_image_status()
 
 
-def _load_api_push_image_tensor():
-    image_path = _api_push_image_path()
-    if image_path is None:
-        raise RuntimeError(
-            "No API-pushed image is available. Push one with POST "
-            f"{API_PUSH_IMAGE_ROUTE} first."
+def _load_api_push_image_tensor(image_id="", source_mode="require_new_api_push"):
+    source_mode = source_mode or "require_new_api_push"
+    consume_pending = source_mode == "require_new_api_push"
+
+    if consume_pending:
+        active_image_id = _read_api_push_pending()
+        missing_message = (
+            "No new API-pushed image is pending for this queue run. Push one with POST "
+            f"{API_PUSH_IMAGE_ROUTE} before queueing, or switch source_mode to "
+            "'use_saved_image_id' and provide image_id."
         )
+    else:
+        active_image_id = _safe_api_push_image_id(image_id)
+        missing_message = "No saved API-pushed image exists for the configured image_id."
+
+    image_path = _api_push_image_path(active_image_id)
+    if image_path is None:
+        raise RuntimeError(missing_message)
 
     output_images = []
     output_masks = []
     w, h = None, None
 
-    img = Image.open(image_path)
-    for frame in ImageSequence.Iterator(img):
-        frame = ImageOps.exif_transpose(frame)
-        image = frame.convert("RGB")
+    try:
+        img = Image.open(image_path)
+        for frame in ImageSequence.Iterator(img):
+            frame = ImageOps.exif_transpose(frame)
+            image = frame.convert("RGB")
 
-        if not output_images:
-            w, h = image.size
+            if not output_images:
+                w, h = image.size
 
-        if image.size != (w, h):
-            continue
+            if image.size != (w, h):
+                continue
 
-        image_np = np.array(image).astype(np.float32) / 255.0
-        output_images.append(torch.from_numpy(image_np)[None,])
+            image_np = np.array(image).astype(np.float32) / 255.0
+            output_images.append(torch.from_numpy(image_np)[None,])
 
-        if "A" in frame.getbands():
-            mask_np = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
-            mask = 1.0 - torch.from_numpy(mask_np)
-        else:
-            mask = torch.zeros((64, 64), dtype=torch.float32)
-        output_masks.append(mask.unsqueeze(0))
+            if "A" in frame.getbands():
+                mask_np = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+                mask = 1.0 - torch.from_numpy(mask_np)
+            else:
+                mask = torch.zeros((64, 64), dtype=torch.float32)
+            output_masks.append(mask.unsqueeze(0))
+    finally:
+        if consume_pending:
+            _clear_api_push_pending()
 
     if not output_images:
         raise RuntimeError(f"API-pushed image could not be loaded: {image_path}")
@@ -634,39 +692,67 @@ def _register_api_push_image_routes():
 
     @routes.delete(API_PUSH_IMAGE_ROUTE)
     async def clear_pushed_image(request):
-        removed = _clear_api_push_image()
-        return web.json_response({"ok": True, "removed": removed, **_api_push_image_status()})
+        image_id = _safe_api_push_image_id(request.query.get("image_id"))
+        removed_file = False
+
+        if image_id:
+            path = _api_push_image_path(image_id)
+            if path is not None:
+                os.remove(path)
+                removed_file = True
+
+        removed_pending = _clear_api_push_pending()
+        return web.json_response({
+            "ok": True,
+            "removed_pending": removed_pending,
+            "removed_file": removed_file,
+            **_api_push_image_status(),
+        })
 
 
 _register_api_push_image_routes()
 
 
 class ApiPushedLoadImage:
+    _source_modes = ["require_new_api_push", "use_saved_image_id"]
+
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {"required": {
+            "source_mode": (cls._source_modes, {"default": "require_new_api_push"}),
+            "image_id": ("STRING", {"default": ""}),
+        }}
 
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("image", "mask")
     FUNCTION = "load_image"
     CATEGORY = "image"
 
-    def load_image(self):
-        return _load_api_push_image_tensor()
+    def load_image(self, source_mode, image_id):
+        return _load_api_push_image_tensor(image_id, source_mode)
 
     @classmethod
-    def IS_CHANGED(cls):
-        path = _api_push_image_path()
+    def IS_CHANGED(cls, source_mode, image_id):
+        if source_mode == "require_new_api_push":
+            active_image_id = _read_api_push_pending()
+            if active_image_id is None:
+                return "pending:missing"
+        else:
+            active_image_id = _safe_api_push_image_id(image_id)
+            if not active_image_id:
+                return "saved:missing"
+
+        path = _api_push_image_path(active_image_id)
         if path is None:
             return "missing"
 
         m = hashlib.sha256()
         with open(path, "rb") as f:
             m.update(f.read())
-        return m.hexdigest()
+        return f"{source_mode}:{active_image_id}:{m.hexdigest()}"
 
     @classmethod
-    def VALIDATE_INPUTS(cls):
+    def VALIDATE_INPUTS(cls, source_mode, image_id):
         return True
 
 # --- NODES ---
