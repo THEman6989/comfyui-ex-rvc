@@ -485,12 +485,30 @@ def _safe_api_push_image_id(image_id):
     if not image_id:
         return ""
 
-    keep = []
-    for char in image_id:
-        if char.isalnum() or char in ("-", "_"):
-            keep.append(char)
+    image_id = os.path.normpath(image_id).replace("\\", "/")
+    if image_id in (".", "..") or image_id.startswith("../") or image_id.startswith("/"):
+        return ""
 
-    return "".join(keep)[:96]
+    safe_parts = []
+    for part in image_id.split("/"):
+        keep = []
+        for char in part:
+            if char.isalnum() or char in ("-", "_", " ", "(", ")"):
+                keep.append(char)
+        safe_part = "".join(keep).strip()
+        if safe_part:
+            safe_parts.append(safe_part[:96])
+
+    return "/".join(safe_parts)
+
+
+def _safe_api_push_filename_stem(filename):
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    keep = []
+    for char in stem:
+        if char.isalnum() or char in ("-", "_", " ", "(", ")"):
+            keep.append(char)
+    return "".join(keep).strip()[:96]
 
 
 def _api_push_image_path(image_id):
@@ -553,6 +571,13 @@ def _api_push_image_status():
     }
 
 
+def _comfy_upload_response_from_path(path, folder_type="input"):
+    relpath = os.path.relpath(path, folder_paths.get_input_directory())
+    subfolder = os.path.dirname(relpath)
+    name = os.path.basename(relpath)
+    return {"name": name, "subfolder": subfolder, "type": folder_type}
+
+
 def _extension_from_content_type(content_type):
     content_type = (content_type or "").split(";")[0].strip().lower()
     return {
@@ -568,14 +593,33 @@ def _extension_from_filename(filename):
     return ext if ext in API_PUSH_IMAGE_EXTENSIONS else None
 
 
-def _save_api_push_image(data, ext):
+def _save_api_push_image(data, ext, filename=None, subfolder="", overwrite=False):
     if not data:
         raise ValueError("No image data received.")
 
     ext = ext if ext in API_PUSH_IMAGE_EXTENSIONS else ".png"
-    image_id = uuid.uuid4().hex
+    image_id = _safe_api_push_filename_stem(filename) or uuid.uuid4().hex
+    image_id = f"{image_id}_{uuid.uuid4().hex[:8]}"
 
-    target_path = os.path.join(API_PUSH_IMAGE_DIR, image_id + ext)
+    safe_subfolder = os.path.normpath(subfolder or "")
+    if safe_subfolder in (".", os.curdir):
+        safe_subfolder = ""
+    if safe_subfolder.startswith("..") or os.path.isabs(safe_subfolder):
+        raise ValueError("Invalid subfolder.")
+
+    target_dir = os.path.abspath(os.path.join(API_PUSH_IMAGE_DIR, safe_subfolder))
+    if os.path.commonpath((os.path.abspath(API_PUSH_IMAGE_DIR), target_dir)) != os.path.abspath(API_PUSH_IMAGE_DIR):
+        raise ValueError("Invalid subfolder.")
+
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.join(target_dir, image_id + ext)
+    if not overwrite:
+        split = os.path.splitext(target_path)
+        counter = 1
+        while os.path.exists(target_path):
+            target_path = f"{split[0]} ({counter}){split[1]}"
+            counter += 1
+
     tmp_path = target_path + ".tmp"
 
     with open(tmp_path, "wb") as f:
@@ -592,33 +636,20 @@ def _save_api_push_image(data, ext):
         raise ValueError(f"Invalid image data: {e}")
 
     os.replace(tmp_path, target_path)
-    _write_api_push_pending(image_id)
-    return _api_push_image_status()
+    saved_image_id = os.path.splitext(os.path.relpath(target_path, API_PUSH_IMAGE_DIR))[0]
+    _write_api_push_pending(saved_image_id)
+
+    status = _api_push_image_status()
+    status.update(_comfy_upload_response_from_path(target_path))
+    return status
 
 
-def _load_api_push_image_tensor(image_id="", source_mode="require_new_api_push"):
-    source_mode = source_mode or "require_new_api_push"
-    consume_pending = source_mode == "require_new_api_push"
-
-    if consume_pending:
-        active_image_id = _read_api_push_pending()
-        missing_message = (
-            "No new API-pushed image is pending for this queue run. Push one with POST "
-            f"{API_PUSH_IMAGE_ROUTE} before queueing, or switch source_mode to "
-            "'use_saved_image_id' and provide image_id."
-        )
-    else:
-        active_image_id = _safe_api_push_image_id(image_id)
-        missing_message = "No saved API-pushed image exists for the configured image_id."
-
-    image_path = _api_push_image_path(active_image_id)
-    if image_path is None:
-        raise RuntimeError(missing_message)
-
+def _load_image_tensor_from_path(image_path):
     output_images = []
     output_masks = []
     w, h = None, None
 
+    img = None
     try:
         img = Image.open(image_path)
         for frame in ImageSequence.Iterator(img):
@@ -641,13 +672,47 @@ def _load_api_push_image_tensor(image_id="", source_mode="require_new_api_push")
                 mask = torch.zeros((64, 64), dtype=torch.float32)
             output_masks.append(mask.unsqueeze(0))
     finally:
-        if consume_pending:
-            _clear_api_push_pending()
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
 
     if not output_images:
-        raise RuntimeError(f"API-pushed image could not be loaded: {image_path}")
+        raise RuntimeError(f"Image could not be loaded: {image_path}")
 
     return (torch.cat(output_images, dim=0), torch.cat(output_masks, dim=0))
+
+
+def _load_api_push_image_tensor(image_id="", source_mode="require_new_api_push", image=""):
+    source_mode = source_mode or "require_new_api_push"
+    consume_pending = source_mode == "require_new_api_push"
+
+    if consume_pending:
+        active_image_id = _read_api_push_pending()
+        missing_message = (
+            "No new API-pushed image is pending for this queue run. Push one with POST "
+            f"{API_PUSH_IMAGE_ROUTE} before queueing, or switch source_mode to "
+            "'use_saved_image_id' and provide image_id."
+        )
+    elif source_mode == "use_saved_image_id":
+        active_image_id = _safe_api_push_image_id(image_id)
+        missing_message = "No saved API-pushed image exists for the configured image_id."
+    else:
+        image_path = folder_paths.get_annotated_filepath(image)
+        if not os.path.exists(image_path):
+            raise RuntimeError(f"Invalid ComfyUI uploaded image file: {image}")
+        return _load_image_tensor_from_path(image_path)
+
+    image_path = _api_push_image_path(active_image_id)
+    if image_path is None:
+        raise RuntimeError(missing_message)
+
+    try:
+        return _load_image_tensor_from_path(image_path)
+    finally:
+        if consume_pending:
+            _clear_api_push_pending()
 
 
 def _register_api_push_image_routes():
@@ -661,26 +726,28 @@ def _register_api_push_image_routes():
     async def push_image(request):
         ext = _extension_from_content_type(request.headers.get("Content-Type"))
         data = None
+        filename = None
+        subfolder = ""
+        overwrite = False
 
         if request.content_type and request.content_type.startswith("multipart/"):
-            reader = await request.multipart()
-            async for field in reader:
-                if field.name not in ("image", "file"):
-                    continue
-                ext = _extension_from_filename(field.filename) or ext
-                chunks = []
-                while True:
-                    chunk = await field.read_chunk()
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                data = b"".join(chunks)
-                break
+            post = await request.post()
+            image = post.get("image") or post.get("file")
+            if image is not None and getattr(image, "file", None):
+                filename = image.filename
+                ext = _extension_from_filename(filename) or ext
+                data = image.file.read()
+            subfolder = post.get("subfolder", "")
+            overwrite_value = post.get("overwrite")
+            overwrite = overwrite_value in ("true", "1", True)
         else:
             data = await request.read()
+            filename = request.query.get("filename")
+            subfolder = request.query.get("subfolder", "")
+            overwrite = request.query.get("overwrite") in ("true", "1")
 
         try:
-            status = _save_api_push_image(data, ext or ".png")
+            status = _save_api_push_image(data, ext or ".png", filename, subfolder, overwrite)
         except ValueError as e:
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
@@ -714,13 +781,17 @@ _register_api_push_image_routes()
 
 
 class ApiPushedLoadImage:
-    _source_modes = ["require_new_api_push", "use_saved_image_id"]
+    _source_modes = ["require_new_api_push", "use_saved_image_id", "use_comfy_upload_image"]
 
     @classmethod
     def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        files = folder_paths.filter_files_content_types(files, ["image"])
         return {"required": {
             "source_mode": (cls._source_modes, {"default": "require_new_api_push"}),
             "image_id": ("STRING", {"default": ""}),
+            "image": (sorted(files), {"image_upload": True}),
         }}
 
     RETURN_TYPES = ("IMAGE", "MASK")
@@ -728,19 +799,28 @@ class ApiPushedLoadImage:
     FUNCTION = "load_image"
     CATEGORY = "image"
 
-    def load_image(self, source_mode, image_id):
-        return _load_api_push_image_tensor(image_id, source_mode)
+    def load_image(self, source_mode, image_id, image):
+        return _load_api_push_image_tensor(image_id, source_mode, image)
 
     @classmethod
-    def IS_CHANGED(cls, source_mode, image_id):
+    def IS_CHANGED(cls, source_mode, image_id, image):
         if source_mode == "require_new_api_push":
             active_image_id = _read_api_push_pending()
             if active_image_id is None:
                 return "pending:missing"
-        else:
+        elif source_mode == "use_saved_image_id":
             active_image_id = _safe_api_push_image_id(image_id)
             if not active_image_id:
                 return "saved:missing"
+        else:
+            path = folder_paths.get_annotated_filepath(image)
+            if not os.path.exists(path):
+                return "comfy_upload:missing"
+
+            m = hashlib.sha256()
+            with open(path, "rb") as f:
+                m.update(f.read())
+            return f"{source_mode}:{image}:{m.hexdigest()}"
 
         path = _api_push_image_path(active_image_id)
         if path is None:
@@ -752,7 +832,7 @@ class ApiPushedLoadImage:
         return f"{source_mode}:{active_image_id}:{m.hexdigest()}"
 
     @classmethod
-    def VALIDATE_INPUTS(cls, source_mode, image_id):
+    def VALIDATE_INPUTS(cls, source_mode, image_id, image):
         return True
 
 # --- NODES ---
