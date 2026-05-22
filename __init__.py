@@ -5,6 +5,9 @@ import torchaudio
 import tempfile
 import shutil
 import folder_paths
+import hashlib
+from datetime import datetime, timezone
+from aiohttp import web
 
 
 
@@ -443,7 +446,7 @@ class RVC_Terminal_Node:
 import torch
 import numpy as np
 import os
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageSequence
 import folder_paths
 
 # --- HILFSFUNKTIONEN ---
@@ -467,6 +470,204 @@ def pil2tensor(image):
         return torch.cat(out, dim=0)
     
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
+
+API_PUSH_IMAGE_DIR = os.path.join(folder_paths.get_input_directory(), "ex_rvc_api_push")
+API_PUSH_IMAGE_BASENAME = "latest_api_push"
+API_PUSH_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+API_PUSH_IMAGE_ROUTE = "/ex-rvc/api/pushed-image"
+os.makedirs(API_PUSH_IMAGE_DIR, exist_ok=True)
+
+
+def _api_push_image_path():
+    for ext in API_PUSH_IMAGE_EXTENSIONS:
+        path = os.path.join(API_PUSH_IMAGE_DIR, API_PUSH_IMAGE_BASENAME + ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _api_push_image_status():
+    path = _api_push_image_path()
+    if path is None:
+        return {"available": False}
+
+    stat = os.stat(path)
+    return {
+        "available": True,
+        "filename": os.path.basename(path),
+        "path": path,
+        "size": stat.st_size,
+        "updated_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+    }
+
+
+def _clear_api_push_image():
+    removed = False
+    for ext in API_PUSH_IMAGE_EXTENSIONS:
+        path = os.path.join(API_PUSH_IMAGE_DIR, API_PUSH_IMAGE_BASENAME + ext)
+        if os.path.exists(path):
+            os.remove(path)
+            removed = True
+    return removed
+
+
+def _extension_from_content_type(content_type):
+    content_type = (content_type or "").split(";")[0].strip().lower()
+    return {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+    }.get(content_type)
+
+
+def _extension_from_filename(filename):
+    ext = os.path.splitext(filename or "")[1].lower()
+    return ext if ext in API_PUSH_IMAGE_EXTENSIONS else None
+
+
+def _save_api_push_image(data, ext):
+    if not data:
+        raise ValueError("No image data received.")
+
+    ext = ext if ext in API_PUSH_IMAGE_EXTENSIONS else ".png"
+
+    target_path = os.path.join(API_PUSH_IMAGE_DIR, API_PUSH_IMAGE_BASENAME + ext)
+    tmp_path = target_path + ".tmp"
+
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+
+    try:
+        with Image.open(tmp_path) as img:
+            img.verify()
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise ValueError(f"Invalid image data: {e}")
+
+    _clear_api_push_image()
+    os.replace(tmp_path, target_path)
+    return _api_push_image_status()
+
+
+def _load_api_push_image_tensor():
+    image_path = _api_push_image_path()
+    if image_path is None:
+        raise RuntimeError(
+            "No API-pushed image is available. Push one with POST "
+            f"{API_PUSH_IMAGE_ROUTE} first."
+        )
+
+    output_images = []
+    output_masks = []
+    w, h = None, None
+
+    img = Image.open(image_path)
+    for frame in ImageSequence.Iterator(img):
+        frame = ImageOps.exif_transpose(frame)
+        image = frame.convert("RGB")
+
+        if not output_images:
+            w, h = image.size
+
+        if image.size != (w, h):
+            continue
+
+        image_np = np.array(image).astype(np.float32) / 255.0
+        output_images.append(torch.from_numpy(image_np)[None,])
+
+        if "A" in frame.getbands():
+            mask_np = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask_np)
+        else:
+            mask = torch.zeros((64, 64), dtype=torch.float32)
+        output_masks.append(mask.unsqueeze(0))
+
+    if not output_images:
+        raise RuntimeError(f"API-pushed image could not be loaded: {image_path}")
+
+    return (torch.cat(output_images, dim=0), torch.cat(output_masks, dim=0))
+
+
+def _register_api_push_image_routes():
+    prompt_server = getattr(getattr(server, "PromptServer", None), "instance", None)
+    if prompt_server is None:
+        return
+
+    routes = prompt_server.routes
+
+    @routes.post(API_PUSH_IMAGE_ROUTE)
+    async def push_image(request):
+        ext = _extension_from_content_type(request.headers.get("Content-Type"))
+        data = None
+
+        if request.content_type and request.content_type.startswith("multipart/"):
+            reader = await request.multipart()
+            async for field in reader:
+                if field.name not in ("image", "file"):
+                    continue
+                ext = _extension_from_filename(field.filename) or ext
+                chunks = []
+                while True:
+                    chunk = await field.read_chunk()
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                break
+        else:
+            data = await request.read()
+
+        try:
+            status = _save_api_push_image(data, ext or ".png")
+        except ValueError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+        return web.json_response({"ok": True, **status})
+
+    @routes.get(API_PUSH_IMAGE_ROUTE)
+    async def get_pushed_image_status(request):
+        return web.json_response(_api_push_image_status())
+
+    @routes.delete(API_PUSH_IMAGE_ROUTE)
+    async def clear_pushed_image(request):
+        removed = _clear_api_push_image()
+        return web.json_response({"ok": True, "removed": removed, **_api_push_image_status()})
+
+
+_register_api_push_image_routes()
+
+
+class ApiPushedLoadImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "load_image"
+    CATEGORY = "image"
+
+    def load_image(self):
+        return _load_api_push_image_tensor()
+
+    @classmethod
+    def IS_CHANGED(cls):
+        path = _api_push_image_path()
+        if path is None:
+            return "missing"
+
+        m = hashlib.sha256()
+        with open(path, "rb") as f:
+            m.update(f.read())
+        return m.hexdigest()
+
+    @classmethod
+    def VALIDATE_INPUTS(cls):
+        return True
 
 # --- NODES ---
 
@@ -1168,6 +1369,7 @@ class RawBatchFrameSelector:
 
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
+    "ApiPushedLoadImage": ApiPushedLoadImage,
      "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
     "Standalone_SaveImageClean": Standalone_SaveImageClean,
     "VAEDtypeChecker": VAEDtypeChecker,
@@ -1184,6 +1386,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RVC_Terminal_Node": "RVC Terminal (Fixed Paths)",
+    "ApiPushedLoadImage": "Load Image (API Push)",
     "Standalone_OverlayTransparentImage": "Overlay Image (Video Supported)",
     "Standalone_SaveImageClean": "Save Image (No Metadata)",
     "VAEDtypeChecker": "VAE Dtype Checker",
