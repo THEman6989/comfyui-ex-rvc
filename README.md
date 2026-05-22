@@ -130,3 +130,42 @@ curl -X DELETE "http://127.0.0.1:8188/ex-rvc/api/pushed-image?image_id=6b4f7a9df
 4. Queue the workflow.
 5. The node consumes that uploaded image once.
 6. The next queue run needs a new upload, unless `use_saved_image_id` or `use_comfy_upload_image` is selected explicitly.
+
+## True Random Seed
+
+Node display name:
+
+```text
+True Random Seed
+```
+
+Internal node key:
+
+```text
+TrueRandomSeed
+```
+
+This node outputs a 64-bit seed for sampler nodes. In `generate_new` mode it uses the operating system cryptographic random source through Python's `secrets` module. The seed is not derived from the previous seed, the workflow JSON, node IDs, or ComfyUI's `control_after_generate` behavior.
+
+Outputs:
+
+- `seed`: integer seed, range `0` to `18446744073709551615`
+- `seed_text`: same seed as text, useful for logging or saving in metadata
+
+### Seed Modes
+
+`mode = generate_new`
+
+Default mode. Generates a new 64-bit seed each time the node executes. This is intended for API workflows where the same workflow JSON is queued repeatedly and should still get a fresh unpredictable seed.
+
+`mode = use_saved_seed`
+
+Repro mode. The node returns the value from `saved_seed`. Use this when you want to re-run a previous result exactly.
+
+### Typical Seed Flow
+
+1. Add `True Random Seed`.
+2. Keep `mode` set to `generate_new`.
+3. Connect `seed` to a sampler seed input.
+4. Save or inspect `seed_text` if you need to reproduce a run later.
+5. For reproduction, set `mode` to `use_saved_seed` and paste the old seed into `saved_seed`.

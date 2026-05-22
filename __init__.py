@@ -7,6 +7,7 @@ import shutil
 import folder_paths
 import hashlib
 import json
+import secrets
 import uuid
 from datetime import datetime, timezone
 from aiohttp import web
@@ -835,6 +836,47 @@ class ApiPushedLoadImage:
     def VALIDATE_INPUTS(cls, source_mode, image_id, image):
         return True
 
+
+class TrueRandomSeed:
+    _seed_modes = ["generate_new", "use_saved_seed"]
+    _max_seed = 0xffffffffffffffff
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "mode": (cls._seed_modes, {"default": "generate_new"}),
+            "saved_seed": ("INT", {
+                "default": 0,
+                "min": 0,
+                "max": cls._max_seed,
+                "tooltip": "Used only when mode is use_saved_seed.",
+            }),
+        }}
+
+    RETURN_TYPES = ("INT", "STRING")
+    RETURN_NAMES = ("seed", "seed_text")
+    FUNCTION = "get_seed"
+    CATEGORY = "Amin/Utils"
+
+    def get_seed(self, mode, saved_seed):
+        if mode == "use_saved_seed":
+            seed = int(saved_seed) & self._max_seed
+        else:
+            seed = secrets.randbits(64)
+
+        return (seed, str(seed))
+
+    @classmethod
+    def IS_CHANGED(cls, mode, saved_seed):
+        if mode == "use_saved_seed":
+            return f"saved:{int(saved_seed) & cls._max_seed}"
+
+        return f"random:{secrets.token_hex(16)}"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, mode, saved_seed):
+        return True
+
 # --- NODES ---
 
 class Standalone_OverlayTransparentImage:
@@ -1536,6 +1578,7 @@ class RawBatchFrameSelector:
 NODE_CLASS_MAPPINGS = {
     "RVC_Terminal_Node": RVC_Terminal_Node,
     "ApiPushedLoadImage": ApiPushedLoadImage,
+    "TrueRandomSeed": TrueRandomSeed,
      "Standalone_OverlayTransparentImage": Standalone_OverlayTransparentImage,
     "Standalone_SaveImageClean": Standalone_SaveImageClean,
     "VAEDtypeChecker": VAEDtypeChecker,
@@ -1553,6 +1596,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RVC_Terminal_Node": "RVC Terminal (Fixed Paths)",
     "ApiPushedLoadImage": "Load Image (API Push)",
+    "TrueRandomSeed": "True Random Seed",
     "Standalone_OverlayTransparentImage": "Overlay Image (Video Supported)",
     "Standalone_SaveImageClean": "Save Image (No Metadata)",
     "VAEDtypeChecker": "VAE Dtype Checker",
