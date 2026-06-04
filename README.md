@@ -169,3 +169,45 @@ Repro mode. The node returns the value from `saved_seed`. Use this when you want
 3. Connect `seed` to a sampler seed input.
 4. Save or inspect `seed_text` if you need to reproduce a run later.
 5. For reproduction, set `mode` to `use_saved_seed` and paste the old seed into `saved_seed`.
+
+---
+
+## Mask Researcher Tools
+
+Custom nodes for video-analysis / researcher workflow.
+
+### 1. Mask Quality Filter
+
+Detect bad segmentation masks before interpolation. Catches: empty masks, tiny masks, sudden huge masks, too-small bounding boxes, centroid jumps, area jumps.
+
+Use when SAM/SAM3/SAM3.1 sometimes tracks the wrong object.
+
+Recommended pipeline:
+```
+SAM masks → Mask Quality Filter → Mask Interpolator Pro
+```
+
+Outputs: `filtered_masks`, `invalid_frame_mask`, `report`
+
+### 2. Mask Interpolator Pro
+
+Repair missing/empty masks over time. If SAM fails on frames, this fills the gap using optical-flow-guided or SDF interpolation.
+
+Recommended pipeline:
+```
+Mask Quality Filter → Mask Interpolator Pro → Mask Crop Stabilizer
+```
+
+### 3. Mask Crop Stabilizer
+
+Create stable crops from video frames + masks. Important before DINOv2/SigLIP/CLIP — unstable crops create false visual jumps.
+
+Outputs: `crops`, `crop_masks`, `report`
+
+### Why this matters for embedding models
+
+If one frame has a broken mask or wildly different crop, DINOv2/SigLIP/CLIP may report a huge embedding difference (false positive). These nodes make the sequence stable before embedding comparison.
+
+### Dependencies
+
+Added to `requirements.txt`: `scipy`, `opencv-python-headless`

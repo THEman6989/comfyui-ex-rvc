@@ -12,6 +12,9 @@ import uuid
 from datetime import datetime, timezone
 from aiohttp import web
 
+# Mask Researcher Tools
+from .mask_researcher_tools import NODE_CLASS_MAPPINGS as _mrt_class_mappings, NODE_DISPLAY_NAME_MAPPINGS as _mrt_display_mappings
+
 
 
 # ======================================================================
@@ -1590,6 +1593,8 @@ NODE_CLASS_MAPPINGS = {
     "ExactImageSaver": ExactImageSaver,
     "RawBatchFrameSelector": RawBatchFrameSelector,
     
+    # Mask Researcher Tools
+    **_mrt_class_mappings,
     
 }
 
@@ -1607,4 +1612,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VRAM_Video_Context_Merger": "Wan Video VRAM Merger (Join)",
     "ExactImageSaver": "💾 Save Image (Exact Name & Overwrite)",
     "RawBatchFrameSelector": "RAW Frame Selector (Preserve Tensor)",
+    
+    # Mask Researcher Tools
+    **_mrt_display_mappings,
 }

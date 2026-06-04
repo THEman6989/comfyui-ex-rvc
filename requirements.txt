@@ -1,2 +1,4 @@
 numpy
 color-matcher
+scipy
+opencv-python-headless
