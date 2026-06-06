@@ -15,6 +15,20 @@ from aiohttp import web
 # Mask Researcher Tools
 from .mask_researcher_tools import NODE_CLASS_MAPPINGS as _mrt_class_mappings, NODE_DISPLAY_NAME_MAPPINGS as _mrt_display_mappings
 
+# Beatdrop / Outfit-Change Nodes
+from .beatdrop_nodes import NODE_CLASS_MAPPINGS as _bdn_class_mappings, NODE_DISPLAY_NAME_MAPPINGS as _bdn_display_mappings
+
+# Frame Embedding Change Detector (DINOv2)
+try:
+    from .frame_embedding_change_detector import (
+        NODE_CLASS_MAPPINGS as _frame_embed_class_mappings,
+        NODE_DISPLAY_NAME_MAPPINGS as _frame_embed_display_mappings,
+    )
+except Exception as exc:
+    print("[FrameEmbeddingChangeDetector] Failed to load:", exc)
+    _frame_embed_class_mappings = {}
+    _frame_embed_display_mappings = {}
+
 
 
 # ======================================================================
@@ -1593,8 +1607,14 @@ NODE_CLASS_MAPPINGS = {
     "ExactImageSaver": ExactImageSaver,
     "RawBatchFrameSelector": RawBatchFrameSelector,
     
+    # Beatdrop / Outfit-Change Nodes
+    **_bdn_class_mappings,
+
     # Mask Researcher Tools
     **_mrt_class_mappings,
+
+    # Frame Embedding Change Detector
+    **_frame_embed_class_mappings,
     
 }
 
@@ -1613,6 +1633,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ExactImageSaver": "💾 Save Image (Exact Name & Overwrite)",
     "RawBatchFrameSelector": "RAW Frame Selector (Preserve Tensor)",
     
+    # Beatdrop / Outfit-Change Nodes
+    **_bdn_display_mappings,
+
     # Mask Researcher Tools
     **_mrt_display_mappings,
+
+    # Frame Embedding Change Detector
+    **_frame_embed_display_mappings,
 }

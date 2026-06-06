@@ -2,3 +2,4 @@ numpy
 color-matcher
 scipy
 opencv-python-headless
+beat-this

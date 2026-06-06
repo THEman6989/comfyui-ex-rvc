@@ -440,6 +440,8 @@ class MaskInterpolatorPro:
             },
             "optional": {
                 "images": ("IMAGE",),
+                "invalid_frame_mask": ("MASK",),
+                "beats_used": ("STRING", {"default": "", "multiline": True, "placeholder": "beats_used from FrameSequenceGenerator — window boundaries for interpolation"}),
             },
         }
 
@@ -459,6 +461,8 @@ class MaskInterpolatorPro:
         morph_radius,
         max_gap,
         images=None,
+        invalid_frame_mask=None,
+        beats_used="",
     ):
         masks_np = to_numpy_mask_batch(masks)
         images_np = to_numpy_image_batch(images) if images is not None else None
@@ -468,13 +472,40 @@ class MaskInterpolatorPro:
         if images_np is not None and images_np.shape[0] != B:
             raise ValueError(f"IMAGE batch must have same batch size as MASK batch. images={images_np.shape[0]}, masks={B}")
 
-        valid = [
-            is_valid_mask(masks_np[i], area_threshold=area_threshold, mean_threshold=mean_threshold)
-            for i in range(B)
-        ]
+        if invalid_frame_mask is not None:
+            invalid_np = to_numpy_mask_batch(invalid_frame_mask)
+            if invalid_np.shape[0] != B:
+                raise ValueError(
+                    f"invalid_frame_mask batch size must match masks. "
+                    f"invalid={invalid_np.shape[0]}, masks={B}"
+                )
+            # A frame is valid unless its invalid_frame_mask has any non-zero pixel
+            valid = [(invalid_np[i].max() < 0.5) for i in range(B)]
+            valid_source = "invalid_frame_mask"
+        else:
+            valid = [
+                is_valid_mask(masks_np[i], area_threshold=area_threshold, mean_threshold=mean_threshold)
+                for i in range(B)
+            ]
+            valid_source = "internal"
 
         out = masks_np.copy()
         valid_idx = [i for i, v in enumerate(valid) if v]
+
+        # --- Parse window boundaries from beats_used ---
+        window_boundaries = set()
+        try:
+            bu = json.loads(beats_used or "[]")
+            if isinstance(bu, list):
+                for entry in bu:
+                    offset = int(entry.get("batch_offset", -1))
+                    count = int(entry.get("batch_frame_count", 0))
+                    if offset >= 0 and count > 0:
+                        last_frame = offset + count - 1
+                        if last_frame < B - 1:
+                            window_boundaries.add(last_frame)
+        except Exception:
+            pass
 
         if len(valid_idx) == 0:
             report = "Mask Interpolator Pro: No valid masks found; returned original masks unchanged."
@@ -490,6 +521,7 @@ class MaskInterpolatorPro:
 
         repaired_count = 0
         large_gaps_fallback = 0
+        boundaries_crossed = 0
 
         for k in range(len(valid_idx) - 1):
             left = valid_idx[k]
@@ -498,6 +530,21 @@ class MaskInterpolatorPro:
 
             if gap <= 0:
                 continue
+
+            # --- Window boundary check: don't interpolate across windows ---
+            if window_boundaries:
+                crossing = sorted([b for b in window_boundaries if left < b < right])
+                if crossing:
+                    boundary = crossing[0]
+                    # Left side of boundary: clamp to left
+                    for j in range(left + 1, boundary + 1):
+                        out[j] = out[left]
+                    # Right side of boundary: clamp to right
+                    for j in range(boundary + 1, right):
+                        out[j] = out[right]
+                    repaired_count += (right - left - 1)
+                    boundaries_crossed += 1
+                    continue
 
             if gap > int(max_gap):
                 for j in range(left + 1, right):
@@ -552,7 +599,10 @@ class MaskInterpolatorPro:
             "valid_before": int(sum(valid)),
             "repaired": int(repaired_count),
             "large_gaps_fallback": int(large_gaps_fallback),
+            "boundaries_crossed": int(boundaries_crossed),
             "method": method_used,
+            "valid_source": valid_source,
+            "window_boundaries": len(window_boundaries),
             "cv2": HAS_CV2,
             "scipy": HAS_SCIPY,
         }
@@ -624,7 +674,10 @@ class MaskCropStabilizer:
                 "mask_mode": (["image_crop", "masked_black", "masked_white"], {"default": "image_crop"}),
                 "mask_threshold": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 0.99, "step": 0.01}),
                 "valid_area_threshold": ("INT", {"default": 64, "min": 1, "max": 1000000}),
-            }
+            },
+            "optional": {
+                "beats_used": ("STRING", {"default": "", "multiline": True, "placeholder": "beats_used from FrameSequenceGenerator — reset smoothing at window boundaries"}),
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "STRING")
@@ -644,6 +697,7 @@ class MaskCropStabilizer:
         mask_mode,
         mask_threshold,
         valid_area_threshold,
+        beats_used="",
     ):
         if not HAS_CV2:
             raise RuntimeError("Mask Crop Stabilizer requires opencv-python. Install it with: pip install opencv-python")
@@ -670,7 +724,35 @@ class MaskCropStabilizer:
                 raw_bboxes.append(None)
 
         filled = fill_bboxes_over_time(raw_bboxes, W, H)
-        smoothed = smooth_bboxes(filled, smoothing=smoothing)
+
+        # --- Window-aware smoothing: reset EMA at window boundaries ---
+        window_boundaries = []
+        try:
+            bu = json.loads(beats_used or "[]")
+            if isinstance(bu, list):
+                for entry in bu:
+                    offset = int(entry.get("batch_offset", -1))
+                    count = int(entry.get("batch_frame_count", 0))
+                    if offset >= 0 and count > 0 and offset + count < B:
+                        window_boundaries.append(offset + count)
+        except Exception:
+            pass
+
+        if window_boundaries and len(window_boundaries) > 0:
+            # Split into windows and smooth each independently
+            starts = [0] + window_boundaries
+            ends = window_boundaries + [B]
+            smoothed_parts = []
+            for ws, we in zip(starts, ends):
+                if we > ws:
+                    win = filled[ws:we]
+                    if len(win) > 1:
+                        smoothed_parts.append(smooth_bboxes(win, smoothing=smoothing))
+                    else:
+                        smoothed_parts.append(win)
+            smoothed = np.concatenate(smoothed_parts, axis=0) if smoothed_parts else filled
+        else:
+            smoothed = smooth_bboxes(filled, smoothing=smoothing)
 
         crops = np.zeros((B, int(output_size), int(output_size), C), dtype=np.float32)
         crop_masks = np.zeros((B, int(output_size), int(output_size)), dtype=np.float32)
@@ -722,14 +804,130 @@ class MaskCropStabilizer:
         return (to_image_tensor(crops), to_mask_tensor(crop_masks), json.dumps(report_obj, indent=2))
 
 
+# ── Beat ↔ Change Synchronizer ───────────────────────────────────────
+
+class BeatChangeSynchronizer:
+    """Aligns audio beatdrops with DINOv2-detected outfit change points.
+
+    Takes beats_used from FrameSequenceGenerator and change_frames from
+    DINOv2FrameChangeDetector, then snaps each beatdrop to the nearest
+    visual outfit change frame within max_distance.
+
+    This ensures the beatdrop timing is synchronized with where the outfit
+    ACTUALLY changes in the video, not just where the audio beat falls.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "beats_used": ("STRING", {"default": "[]", "multiline": True,
+                    "tooltip": "beats_used JSON from FrameSequenceGenerator"}),
+                "change_frames": ("STRING", {"default": "[]", "multiline": True,
+                    "tooltip": "change_frames_json from DINOv2FrameChangeDetector"}),
+                "max_distance": ("INT", {"default": 30, "min": 1, "max": 300, "step": 1,
+                    "tooltip": "Max frames a beatdrop can be snapped to reach a change point"}),
+                "mode": (["snap_nearest", "snap_before", "snap_after"], {"default": "snap_nearest",
+                    "tooltip": "snap_nearest: closest change frame. snap_before: only earlier. snap_after: only later."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("synced_beats", "sync_report")
+    FUNCTION = "sync"
+    CATEGORY = "Amin/Researcher"
+
+    def sync(self, beats_used, change_frames, max_distance, mode):
+        try:
+            beats = json.loads(beats_used or "[]")
+        except json.JSONDecodeError:
+            return (beats_used, json.dumps({"error": "Invalid beats_used JSON"}))
+
+        try:
+            changes = json.loads(change_frames or "[]")
+        except json.JSONDecodeError:
+            return (beats_used, json.dumps({"error": "Invalid change_frames JSON"}))
+
+        if not beats or not changes:
+            report = {"synced": 0, "total_beats": len(beats), "total_changes": len(changes),
+                      "note": "No beats or changes to sync — returning original beats"}
+            return (json.dumps(beats, indent=2), json.dumps(report, indent=2))
+
+        # Extract change frame indices
+        change_indices = [ch["frame_index"] for ch in changes if ch.get("is_outfit_change", True)]
+
+        if not change_indices:
+            report = {"synced": 0, "total_beats": len(beats), "total_changes": 0,
+                      "note": "No outfit changes detected — returning original beats"}
+            return (json.dumps(beats, indent=2), json.dumps(report, indent=2))
+
+        synced_beats = []
+        sync_log = []
+        used_changes = set()
+
+        for beat in beats:
+            beat_copy = dict(beat)
+            beat_frame = beat.get("frame_index", beat.get("batch_offset", 0))
+            best_dist = max_distance + 1
+            best_change = None
+
+            for ci in change_indices:
+                dist = abs(beat_frame - ci)
+                if dist > max_distance:
+                    continue
+
+                # Filter by mode
+                if mode == "snap_before" and ci > beat_frame:
+                    continue
+                if mode == "snap_after" and ci < beat_frame:
+                    continue
+
+                if dist < best_dist:
+                    best_dist = dist
+                    best_change = ci
+
+            if best_change is not None:
+                beat_copy["frame_index"] = best_change
+                beat_copy["original_frame_index"] = beat_frame
+                beat_copy["synced_to_change"] = True
+                beat_copy["sync_distance"] = best_dist
+                used_changes.add(best_change)
+                sync_log.append({
+                    "beat_index": beat.get("beat_index"),
+                    "original_frame": beat_frame,
+                    "synced_frame": best_change,
+                    "distance": best_dist,
+                })
+
+            synced_beats.append(beat_copy)
+
+        report = {
+            "synced": len(sync_log),
+            "total_beats": len(beats),
+            "total_changes": len(change_indices),
+            "changes_used": len(used_changes),
+            "max_distance": int(max_distance),
+            "mode": mode,
+            "sync_details": sync_log,
+            "unmatched_changes": [ci for ci in change_indices if ci not in used_changes],
+        }
+
+        return (
+            json.dumps(synced_beats, indent=2),
+            json.dumps(report, indent=2),
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "MaskQualityFilter": MaskQualityFilter,
     "MaskInterpolatorPro": MaskInterpolatorPro,
     "MaskCropStabilizer": MaskCropStabilizer,
+    "BeatChangeSynchronizer": BeatChangeSynchronizer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskQualityFilter": "Mask Quality Filter",
     "MaskInterpolatorPro": "Mask Interpolator Pro",
     "MaskCropStabilizer": "Mask Crop Stabilizer",
+    "BeatChangeSynchronizer": "Beat ↔ Change Synchronizer",
 }

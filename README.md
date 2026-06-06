@@ -172,6 +172,48 @@ Repro mode. The node returns the value from `saved_seed`. Use this when you want
 
 ---
 
+## Beatdrop / Outfit Change Nodes
+
+Category: `Amin/Beatdrop`
+
+### AlphaRavis Judge (Same Thread)
+
+Internal node key:
+
+```text
+AlphaRavisJudgeNode
+```
+
+Thin API client for AlphaRavis. It does not judge inside ComfyUI. It sends the selected frame URLs and metadata to the AlphaRavis OpenAI-compatible bridge so AlphaRavis can keep the current thread context and delegate the judgment to a subagent if needed.
+
+Important inputs:
+
+- `selected_paths`: newline-separated frame URLs from `DuoSelectorNode`.
+- `alpha_endpoint`: usually `http://<AI_STACK_FIXED_IP>:8123/v1/chat/completions`.
+- `conversation_id` / optional `thread_id`: required for same-thread routing.
+- `job_policy`: `main_job_only`, `every_job`, `only_on_drop`, or `manual`.
+- `run_id`, `job_id`, `drop_id`, `beats_json`, `context_json`: optional context for AlphaRavis.
+
+Outputs:
+
+- `verdict_json`: normalized AlphaRavis JSON verdict.
+- `rejected_frames`: newline-separated rejected frame identifiers.
+- `penalty_json`: map usable by `DuoSelectorNode.extra_penalty_json`.
+- `should_restart`: boolean retry flag.
+- `raw_response`: raw AlphaRavis answer text.
+
+Typical loop:
+
+```text
+BeatItNode → FrameSequenceGenerator → DuoSelectorNode → AlphaRavisJudgeNode
+                                      ↑                         │
+                                      └──── penalty_json ───────┘
+```
+
+`DuoSelectorNode` always selects the lowest-penalty frames first, so rejected frames stay at the end on retries.
+
+---
+
 ## Mask Researcher Tools
 
 Custom nodes for video-analysis / researcher workflow.
