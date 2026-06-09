@@ -833,7 +833,7 @@ class BeatChangeSynchronizer:
         }
 
     RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("beats_used", "sync_report")
+    RETURN_NAMES = ("synced_beats", "sync_report")
     FUNCTION = "sync"
     CATEGORY = "Amin/Researcher"
 
