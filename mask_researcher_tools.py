@@ -1,12 +1,19 @@
 import json
 import math
+import random
+from typing import Any
 import numpy as np
 import torch
 
+import folder_paths
+from nodes import SaveImage
+
 try:
+    cv2: Any = None
     import cv2
     HAS_CV2 = True
 except Exception:
+    cv2 = None
     HAS_CV2 = False
 
 try:
@@ -61,6 +68,29 @@ def to_mask_tensor(arr):
 
 def to_image_tensor(arr):
     return torch.from_numpy(np.clip(arr, 0.0, 1.0).astype(np.float32))
+
+
+def _broadcast_batch(arr, target_b, name):
+    if arr.shape[0] == target_b:
+        return arr
+    if arr.shape[0] == 1:
+        return np.repeat(arr, target_b, axis=0)
+    raise ValueError(f"{name} batch size must be 1 or {target_b}; got {arr.shape[0]}")
+
+
+def _resize_mask_batch(arr, height, width, name):
+    if arr.shape[1] == height and arr.shape[2] == width:
+        return arr
+    if not HAS_CV2:
+        raise RuntimeError(
+            f"{name} resolution is {arr.shape[1]}x{arr.shape[2]}, expected {height}x{width}. "
+            "Install opencv-python or resize masks before Mask Diff Preview."
+        )
+
+    out = np.zeros((arr.shape[0], height, width), dtype=np.float32)
+    for i in range(arr.shape[0]):
+        out[i] = cv2.resize(arr[i].astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+    return out
 
 
 def mask_stats(mask, threshold=0.5):
@@ -804,6 +834,71 @@ class MaskCropStabilizer:
         return (to_image_tensor(crops), to_mask_tensor(crop_masks), json.dumps(report_obj, indent=2))
 
 
+# ------------------------------------------------------------
+# Node 4: Mask Diff Preview
+# ------------------------------------------------------------
+
+class MaskDiffPreview(SaveImage):
+    """Show and output the simple difference between two mask batches."""
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_temp_" + "".join(random.choice("abcdefghijklmnopqrstupvxyz") for _ in range(5))
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask_1": ("MASK",),
+                "mask_2": ("MASK",),
+                "preview_mode": (["white_diff", "blue_red_direction"], {"default": "white_diff"}),
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("diff_mask",)
+    FUNCTION = "preview"
+    OUTPUT_NODE = True
+    CATEGORY = "mask/video"
+
+    def preview(
+        self,
+        mask_1,
+        mask_2,
+        preview_mode="white_diff",
+        prompt=None,
+        extra_pnginfo=None,
+    ):
+        a = to_numpy_mask_batch(mask_1)
+        b = to_numpy_mask_batch(mask_2)
+
+        batch_size = max(a.shape[0], b.shape[0])
+        a = _broadcast_batch(a, batch_size, "mask_1")
+        b = _broadcast_batch(b, batch_size, "mask_2")
+
+        height, width = a.shape[1], a.shape[2]
+        b = _resize_mask_batch(b, height, width, "mask_2")
+
+        diff = np.abs(np.clip(b, 0.0, 1.0) - np.clip(a, 0.0, 1.0)).astype(np.float32)
+        if preview_mode == "blue_red_direction":
+            blue = np.clip(a - b, 0.0, 1.0)
+            red = np.clip(b - a, 0.0, 1.0)
+            preview_arr = np.zeros((batch_size, height, width, 3), dtype=np.float32)
+            preview_arr[..., 0] = red
+            preview_arr[..., 2] = blue
+        else:
+            preview_arr = np.repeat(diff[..., None], 3, axis=-1)
+        preview_tensor = to_image_tensor(preview_arr)
+        ui = self.save_images(preview_tensor, "MaskDiffPreview", prompt, extra_pnginfo)
+        return {
+            **ui,
+            "result": (to_mask_tensor(diff),),
+        }
+
+
 # ── Beat ↔ Change Synchronizer ───────────────────────────────────────
 
 class BeatChangeSynchronizer:
@@ -922,6 +1017,7 @@ NODE_CLASS_MAPPINGS = {
     "MaskQualityFilter": MaskQualityFilter,
     "MaskInterpolatorPro": MaskInterpolatorPro,
     "MaskCropStabilizer": MaskCropStabilizer,
+    "MaskDiffPreview": MaskDiffPreview,
     "BeatChangeSynchronizer": BeatChangeSynchronizer,
 }
 
@@ -929,5 +1025,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskQualityFilter": "Mask Quality Filter",
     "MaskInterpolatorPro": "Mask Interpolator Pro",
     "MaskCropStabilizer": "Mask Crop Stabilizer",
+    "MaskDiffPreview": "Mask Diff Preview",
     "BeatChangeSynchronizer": "Beat ↔ Change Synchronizer",
 }

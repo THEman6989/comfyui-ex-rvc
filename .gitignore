@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+
+# Local Graphify/embedding artifacts
+graphify-out/

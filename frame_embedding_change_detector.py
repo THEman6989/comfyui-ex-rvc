@@ -341,21 +341,22 @@ class DINOv2FrameChangeDetector:
             top_changes = top_changes[:1] if top_changes else []
             best_score = top_changes[0]["score"] if top_changes else 0.0
             detected_change_frame = None
-            confidence = 0.3  # Low confidence — no real change found
+            confidence = 0.0  # No detected visual change; DINO is not a drop authority.
 
         # ── Alignment ──
-        total_offset = int(alignment_offset_frames) + int(manual_offset_frames)
+        requested_total_offset = int(alignment_offset_frames) + int(manual_offset_frames)
+        applied_offset = requested_total_offset if has_existing else 0
 
         if has_existing and detected_change_frame is not None:
-            aligned_drop_frame = detected_change_frame + total_offset
+            aligned_drop_frame = detected_change_frame + applied_offset
             last_old = detected_change_frame
             first_new = detected_change_frame
         elif needs_generated:
-            # Plan synthetic drop at beat_frame + offset
-            planned = beat_frame + total_offset
-            aligned_drop_frame = planned
-            last_old = planned - 1
-            first_new = planned
+            # No visual change: the audio beat remains authoritative and visual
+            # alignment offsets must not move it.
+            aligned_drop_frame = beat_frame
+            last_old = beat_frame - 1
+            first_new = beat_frame
             detected_change_frame = None
         else:
             # No change and no generation (detect_existing_change mode, no strong change)
@@ -386,11 +387,16 @@ class DINOv2FrameChangeDetector:
             "alignment": {
                 "alignment_offset_frames": int(alignment_offset_frames),
                 "manual_offset_frames": int(manual_offset_frames),
-                "total_offset": total_offset,
+                "requested_total_offset": requested_total_offset,
+                "total_offset": applied_offset,
                 "final_drop_frame": aligned_drop_frame,
             },
             "has_existing_visual_change": has_existing,
             "needs_generated_outfit_drop": needs_generated,
+            "dino_used_for_drop_decision": bool(has_existing),
+            "drop_decision_source": (
+                "dinov2_visual_change" if has_existing else "audio_beat"
+            ),
             "last_old_outfit_frame": last_old,
             "first_new_outfit_frame": first_new,
             "confidence": round(confidence, 4),
@@ -398,11 +404,10 @@ class DINOv2FrameChangeDetector:
 
         if needs_generated and not has_existing:
             result["reason"] = (
-                "No visual change above threshold; "
-                f"using beat frame {beat_frame} + offset {total_offset} "
-                f"= {aligned_drop_frame} as planned outfit-drop point."
+                "No visual outfit change above threshold; DINOv2 is ignored for "
+                f"drop timing and the audio beat at frame {beat_frame} remains authoritative."
             )
-            result["planned_drop_frame"] = aligned_drop_frame
+            result["dino_ignored_reason"] = "no_existing_visual_outfit_change"
 
         # Report string
         report_lines = [
@@ -420,7 +425,7 @@ class DINOv2FrameChangeDetector:
             report_lines.append(f"  [NONE] No visual change above threshold (best={best_score:.4f})")
         if needs_generated:
             report_lines.append(
-                f"  [PLAN] Synthetic outfit drop planned at frame {aligned_drop_frame}"
+                f"  [AUDIO] DINO ignored for timing; audio beat frame {aligned_drop_frame} is authoritative"
             )
         report_lines.append(
             f"  last_old={last_old} first_new={first_new} "

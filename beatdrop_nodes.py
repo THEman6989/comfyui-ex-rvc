@@ -52,6 +52,22 @@ class FrameSequenceGenerator:
                 "beats_json": ("STRING", {"default": "", "multiline": True, "placeholder": "JSON from BeatIt node (optional, overrides manual range)"}),
                 "drops_only": ("BOOLEAN", {"default": False, "tooltip": "Only extract frames around beats marked as drops (is_drop=true)"}),
                 "main_job_only": ("BOOLEAN", {"default": False, "tooltip": "Only extract frames around the strongest drop (highest energy_jump)"}),
+                "beat_selection_mode": (["legacy", "all_beats", "drops_only", "beats_before_drop", "beats_after_drop"], {
+                    "default": "legacy",
+                    "tooltip": "Select all beats, drops, or beats strictly before/after an anchor drop. legacy preserves the two boolean filters.",
+                }),
+                "anchor_drop_strategy": (["first_downbeat_drop", "first_drop", "strongest_drop"], {
+                    "default": "first_downbeat_drop",
+                    "tooltip": "How before/after modes choose their anchor drop.",
+                }),
+                "ignore_start_seconds": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "Ignore startup transients before this time for explicit beat-selection modes.",
+                }),
+                "max_beat_time_seconds": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.001,
+                    "tooltip": "Optional upper beat-time bound; 0 disables it. Set to the video duration to reject boundary predictions.",
+                }),
                 "start_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "step": 0.1}),
                 "end_seconds": ("FLOAT", {"default": 2.0, "min": 0.1, "step": 0.1}),
                 "audio": ("AUDIO",),
@@ -63,8 +79,96 @@ class FrameSequenceGenerator:
     FUNCTION = "generate"
     CATEGORY = "Amin/Beatdrop"
 
+    @staticmethod
+    def _frame_timestamps(source_indices, batch_offset, fps, start_time_seconds=None):
+        """Create stable source↔batch frame mappings with exact timestamps."""
+        fps = max(1e-6, float(fps))
+        return [
+            {
+                "batch_index": int(batch_offset + local_index),
+                "source_frame_index": int(source_index),
+                "time_seconds": round(
+                    float(start_time_seconds) + local_index / fps
+                    if start_time_seconds is not None
+                    else float(source_index) / fps,
+                    6,
+                ),
+            }
+            for local_index, source_index in enumerate(source_indices)
+        ]
+
+    @staticmethod
+    def _select_beats_for_mode(beats, mode="legacy", anchor_strategy="first_downbeat_drop",
+                               ignore_start_seconds=1.0, max_time_seconds=0.0):
+        """Select beat phases around one stable anchor drop without mutating input."""
+        mode = str(mode or "legacy").strip()
+        ordered = sorted(
+            (dict(beat) for beat in beats if isinstance(beat, dict)),
+            key=lambda beat: float(beat.get("time_seconds", 0.0)),
+        )
+        if mode == "legacy":
+            return ordered, None
+
+        start = max(0.0, float(ignore_start_seconds))
+        maximum = float(max_time_seconds or 0.0)
+        eligible = [
+            beat for beat in ordered
+            if float(beat.get("time_seconds", 0.0)) >= start
+            and (maximum <= 0.0 or float(beat.get("time_seconds", 0.0)) <= maximum)
+        ]
+        if mode == "all_beats":
+            return eligible, None
+        if mode == "drops_only":
+            return [beat for beat in eligible if beat.get("is_drop", False)], None
+        if mode not in {"beats_before_drop", "beats_after_drop"}:
+            raise ValueError(f"Unknown beat_selection_mode: {mode}")
+
+        drops = [beat for beat in eligible if beat.get("is_drop", False)]
+        if not drops:
+            raise RuntimeError(f"{mode} requires at least one drop after {start:.3f}s")
+
+        strategy = str(anchor_strategy or "first_downbeat_drop").strip()
+        if strategy == "first_downbeat_drop":
+            anchor = next((beat for beat in drops if beat.get("is_downbeat", False)), drops[0])
+        elif strategy == "first_drop":
+            anchor = drops[0]
+        elif strategy == "strongest_drop":
+            anchor = max(
+                drops,
+                key=lambda beat: (
+                    float(beat.get("energy_jump", 0.0)),
+                    float(beat.get("drop_confidence", 0.0)),
+                ),
+            )
+        else:
+            raise ValueError(f"Unknown anchor_drop_strategy: {strategy}")
+
+        anchor_time = float(anchor.get("time_seconds", 0.0))
+        if mode == "beats_before_drop":
+            selected = [beat for beat in eligible if float(beat.get("time_seconds", 0.0)) < anchor_time]
+            relation = "before"
+        else:
+            selected = [beat for beat in eligible if float(beat.get("time_seconds", 0.0)) > anchor_time]
+            relation = "after"
+
+        annotated = [
+            {
+                **beat,
+                "selection_mode": mode,
+                "relative_to_anchor": relation,
+                "anchor_drop_time_seconds": round(anchor_time, 6),
+                "anchor_drop_frame_index": int(anchor.get("frame_index", 0)),
+                "anchor_drop_strategy": strategy,
+            }
+            for beat in selected
+        ]
+        return annotated, dict(anchor)
+
     def generate(self, video, base_url, filename_prefix, fps, window_seconds,
-                 images=None, beats_json="", drops_only=False, main_job_only=False, start_seconds=0.0, end_seconds=2.0, audio=None):
+                 images=None, beats_json="", drops_only=False, main_job_only=False,
+                 beat_selection_mode="legacy", anchor_drop_strategy="first_downbeat_drop",
+                 ignore_start_seconds=1.0, max_beat_time_seconds=0.0,
+                 start_seconds=0.0, end_seconds=2.0, audio=None):
         fps = max(1.0, min(float(fps), 120.0))
         window = max(0.2, float(window_seconds))
 
@@ -78,17 +182,27 @@ class FrameSequenceGenerator:
         if not isinstance(beats, list):
             beats = []
 
-        # Filter to drops only if requested
-        if drops_only and beats:
-            beats = [b for b in beats if b.get("is_drop", False)]
+        if str(beat_selection_mode).strip() != "legacy" and beats:
+            beats, _anchor = self._select_beats_for_mode(
+                beats,
+                mode=beat_selection_mode,
+                anchor_strategy=anchor_drop_strategy,
+                ignore_start_seconds=ignore_start_seconds,
+                max_time_seconds=max_beat_time_seconds,
+            )
             if not beats:
-                raise RuntimeError("drops_only=True but no beats marked as drops in beats_json")
+                raise RuntimeError(f"beat_selection_mode={beat_selection_mode} selected no beats")
+        else:
+            # Backward-compatible boolean filters.
+            if drops_only and beats:
+                beats = [b for b in beats if b.get("is_drop", False)]
+                if not beats:
+                    raise RuntimeError("drops_only=True but no beats marked as drops in beats_json")
 
-        # Keep only the strongest drop if requested
-        if main_job_only and beats:
-            def _drop_strength(b):
-                return float(b.get("energy_jump", 0)) or float(b.get("drop_confidence", 0))
-            beats = [max(beats, key=_drop_strength)]
+            if main_job_only and beats:
+                def _drop_strength(b):
+                    return float(b.get("energy_jump", 0)) or float(b.get("drop_confidence", 0))
+                beats = [max(beats, key=_drop_strength)]
 
         # --- IMAGE mode: slice existing batch by beat windows ---
         if images is not None:
@@ -124,7 +238,15 @@ class FrameSequenceGenerator:
                         actual_end = dur
                 f1 = min(B, int(actual_end * fps) + 1)
                 idx_ranges = [(f0, f1)]
-                beats_used = []
+                beats_used = [{
+                    "beat_index": None,
+                    "time_seconds": round(float(start_seconds), 3),
+                    "frame_index": f0,
+                    "is_drop": False,
+                    "fallback": "manual_range",
+                    "range_start": round(float(start_seconds), 3),
+                    "range_end": round(float(actual_end), 3),
+                }]
 
             # Collect frames from all ranges, tracking batch offsets
             selected = []
@@ -136,6 +258,9 @@ class FrameSequenceGenerator:
                 if wi < len(beats_used):
                     beats_used[wi]["batch_offset"] = batch_offset
                     beats_used[wi]["batch_frame_count"] = n_frames
+                    beats_used[wi]["frames"] = self._frame_timestamps(
+                        range(f0, f1), batch_offset, fps,
+                    )
                 batch_offset += n_frames
             if not selected:
                 raise RuntimeError("No frames in selected ranges")
@@ -217,7 +342,28 @@ class FrameSequenceGenerator:
                                    "range_start": round(t_start, 3),
                                    "range_end": round(t_end, 3),
                                    "batch_offset": batch_offset,
-                                   "batch_frame_count": n_frames})
+                                   "batch_frame_count": n_frames,
+                                   "frames": self._frame_timestamps(
+                                       range(int(round(t_start * fps)), int(round(t_start * fps)) + n_frames),
+                                       batch_offset, fps, start_time_seconds=t_start,
+                                   )})
+            else:
+                source_start = int(round(t_start * fps))
+                beats_used.append({
+                    "beat_index": None,
+                    "time_seconds": round(t_start, 3),
+                    "frame_index": source_start,
+                    "is_drop": False,
+                    "fallback": "manual_range",
+                    "range_start": round(t_start, 3),
+                    "range_end": round(t_end, 3),
+                    "batch_offset": batch_offset,
+                    "batch_frame_count": n_frames,
+                    "frames": self._frame_timestamps(
+                        range(source_start, source_start + n_frames),
+                        batch_offset, fps, start_time_seconds=t_start,
+                    ),
+                })
             batch_offset += n_frames
 
         if not all_images:
@@ -320,6 +466,8 @@ class BeatItNode:
                 "audio": ("AUDIO",),
                 "audio_path": ("STRING", {"default": "", "multiline": False}),
                 "video": ("STRING", {"default": "", "multiline": False, "placeholder": "Video path — audio is auto-extracted via ffmpeg"}),
+                "max_beats": ("INT", {"default": 64, "min": 1, "max": 512, "step": 1,
+                                      "tooltip": "Maximum beat events returned; raise for long or fast clips."}),
             },
         }
 
@@ -330,10 +478,25 @@ class BeatItNode:
 
     def _detect_with_beatthis(self, audio_path, fps):
         import numpy as np
-        from beat_this import load_audio, beat_this as bt
+        from beat_this.inference import File2Beats
+        from beat_this.preprocessing import load_audio
 
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        float16 = device.startswith("cuda")
+        predictor = getattr(self, "_beatthis_predictor", None)
+        predictor_key = (device, float16)
+        if predictor is None or getattr(self, "_beatthis_predictor_key", None) != predictor_key:
+            predictor = File2Beats(
+                checkpoint_path="final0",
+                device=device,
+                float16=float16,
+                dbn=False,
+            )
+            self._beatthis_predictor = predictor
+            self._beatthis_predictor_key = predictor_key
+
+        beats, downbeats = predictor(audio_path)
         audio, sr = load_audio(audio_path)
-        beats, downbeats = bt(audio, sr)
 
         if not len(beats):
             return []
@@ -383,7 +546,7 @@ class BeatItNode:
 
             is_downbeat = any(abs(t - float(db)) < 0.05 for db in downbeats)
             is_drop = jump >= 1.8 or (jump >= 1.4 and is_downbeat)
-            drop_confidence = min(1.0, (jump - 1.0) / 1.5)
+            drop_confidence = max(0.0, min(1.0, (jump - 1.0) / 1.5))
 
             result.append({
                 "time_seconds": round(t, 3),
@@ -397,7 +560,7 @@ class BeatItNode:
             })
         return result
 
-    def _detect_with_rms(self, audio_path, fps):
+    def _detect_with_rms(self, audio_path, fps, max_beats=64):
         if not audio_path or not os.path.isfile(audio_path):
             raise ValueError(f"Audio file not found: {audio_path}")
 
@@ -498,10 +661,12 @@ class BeatItNode:
             else:
                 merged.append(b)
 
-        return (_json.dumps(merged[:12]), len(merged[:12]))
+        limit = max(1, min(int(max_beats), 512))
+        return (_json.dumps(merged[:limit]), len(merged[:limit]))
 
-    def detect(self, audio=None, audio_path="", fps=30.0, video=""):
+    def detect(self, audio=None, audio_path="", fps=30.0, video="", max_beats=64):
         fps = max(1.0, float(fps))
+        max_beats = max(1, min(int(max_beats), 512))
         tmp_wav = None
 
         # Priority: AUDIO tensor > video > audio_path
@@ -537,6 +702,10 @@ class BeatItNode:
                     os.unlink(tmp_wav)
                 except Exception:
                     pass
+                tmp_wav = None
+                if "output file does not contain any stream" in err.lower():
+                    print("[BeatIt] Video has no audio stream; returning an empty beat analysis.")
+                    return ("[]", 0)
                 raise RuntimeError(f"Failed to extract audio from video: {err[:500]}")
 
         try:
@@ -547,12 +716,15 @@ class BeatItNode:
             try:
                 beats = self._detect_with_beatthis(audio_path, fps)
                 if beats:
-                    return (_json.dumps(beats[:16]), len(beats[:16]))
-            except Exception:
-                pass
+                    return (_json.dumps(beats[:max_beats]), len(beats[:max_beats]))
+            except Exception as exc:
+                print(
+                    "[BeatIt] beat_this failed; falling back to RMS: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
             # Fallback to RMS
-            return self._detect_with_rms(audio_path, fps)
+            return self._detect_with_rms(audio_path, fps, max_beats=max_beats)
         finally:
             if tmp_wav:
                 try:
@@ -1037,7 +1209,7 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FrameSequenceGenerator": "🎬 Frame Sequence Generator",
-    "BeatItNode": "🔊 BeatIt (RMS Drop Detector)",
+    "BeatItNode": "🔊 BeatIt (BeatThis + RMS Fallback)",
     "DuoSelectorNode": "👥 Duo Selector (API Style)",
     "JudgeNode": "⚖️ Judge (Outfit Check + Penalty)",
     "AlphaRavisJudgeNode": "🧠 AlphaRavis Judge (Same Thread)",
