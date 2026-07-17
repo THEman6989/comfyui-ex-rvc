@@ -3,6 +3,7 @@ Frame Sequence Generator — extracts frame windows from video,
 saves them to ComfyUI output, and exposes both IMAGE tensors
 and HTTP paths for downstream nodes.
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -1199,6 +1200,159 @@ class AlphaRavisJudgeNode:
         )
 
 
+class BeatDropOutfitIteratorNode:
+    @staticmethod
+    def _reject_non_finite_json_constant(value):
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    @staticmethod
+    def _validate_images(images):
+        if not isinstance(images, torch.Tensor):
+            raise ValueError("images must be a torch.Tensor IMAGE batch")
+        if images.ndim != 4:
+            raise ValueError("images must be a 4-D IMAGE batch")
+        if images.shape[0] == 0 or images.numel() == 0:
+            raise ValueError("images batch must be nonempty")
+
+    @staticmethod
+    def _validate_identity(field, value, source):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{source} {field} must be a nonblank string")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "schedule_json": ("STRING", {"multiline": True}),
+                "run_id": ("STRING",),
+                "plan_hash": ("STRING",),
+                "iteration": ("INT", {"min": 0}),
+                "attempt_id": ("STRING",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "STRING", "BOOLEAN", "INT")
+    RETURN_NAMES = (
+        "current_image",
+        "outfit_state",
+        "beat_frame",
+        "item_json",
+        "done",
+        "total",
+    )
+    FUNCTION = "iterate"
+    CATEGORY = "Amin/Beatdrop"
+
+    @classmethod
+    def IS_CHANGED(cls, images, schedule_json, run_id, plan_hash, iteration, attempt_id):
+        cls._validate_images(images)
+        if not isinstance(schedule_json, str):
+            raise ValueError("schedule_json must be a string")
+        if not isinstance(iteration, int) or isinstance(iteration, bool) or iteration < 0:
+            raise ValueError("iteration must be a non-negative integer")
+        identities = {
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "plan_hash": plan_hash,
+        }
+        for field, value in identities.items():
+            cls._validate_identity(field, value, "input")
+
+        tensor = images.detach().resolve_conj().resolve_neg().to(device="cpu").contiguous()
+        metadata = {
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "plan_hash": plan_hash,
+            "iteration": iteration,
+            "schedule_json": schedule_json,
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+        }
+        digest = hashlib.sha256(
+            _json.dumps(
+                metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(tensor.view(torch.uint8).numpy().tobytes(order="C"))
+        return digest.hexdigest()
+
+    def iterate(self, images, schedule_json, run_id, plan_hash, iteration, attempt_id):
+        self._validate_images(images)
+        identities = {
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "plan_hash": plan_hash,
+        }
+        for field, value in identities.items():
+            self._validate_identity(field, value, "input")
+        try:
+            schedule = _json.loads(
+                schedule_json,
+                parse_constant=self._reject_non_finite_json_constant,
+            )
+            _json.dumps(schedule, allow_nan=False)
+        except (TypeError, ValueError, _json.JSONDecodeError) as exc:
+            raise ValueError(
+                "schedule_json must contain a valid JSON object with only finite numbers"
+            ) from exc
+        if not isinstance(schedule, dict):
+            raise ValueError("schedule_json root must be a JSON object")
+        for field, expected in identities.items():
+            actual = schedule.get(field)
+            self._validate_identity(field, actual, "schedule")
+            if actual != expected:
+                raise ValueError(f"schedule {field} does not match input {field}")
+        items = schedule.get("items")
+        if not isinstance(items, list):
+            raise ValueError("schedule items must be a list")
+        if not isinstance(iteration, int) or isinstance(iteration, bool) or iteration < 0:
+            raise ValueError("iteration must be a non-negative integer")
+        if not items:
+            raise ValueError("schedule items must not be empty")
+        if iteration >= len(items):
+            raise IndexError(f"iteration {iteration} is outside schedule items")
+        item = items[iteration]
+        if not isinstance(item, dict):
+            raise ValueError(f"schedule item {iteration} must be an object")
+        image_index = item.get("outfit_batch_index")
+        if not isinstance(image_index, int) or isinstance(image_index, bool):
+            raise ValueError("outfit_batch_index must be an integer")
+        if image_index < 0 or image_index >= images.shape[0]:
+            raise IndexError("outfit_batch_index is outside the image batch")
+        outfit_state = item.get("outfit_state")
+        if (
+            not isinstance(outfit_state, int)
+            or isinstance(outfit_state, bool)
+            or outfit_state < 0
+        ):
+            raise ValueError("outfit_state must be a non-negative integer")
+        beat_frame = item.get("beat_frame")
+        if not isinstance(beat_frame, int) or isinstance(beat_frame, bool) or beat_frame < 0:
+            raise ValueError("beat_frame must be a non-negative integer")
+        try:
+            item_json = _json.dumps(
+                item,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("schedule item must contain valid finite JSON values") from exc
+        return (
+            images[image_index:image_index + 1],
+            outfit_state,
+            beat_frame,
+            item_json,
+            iteration == len(items) - 1,
+            len(items),
+        )
+
+
 # ComfyUI registration — at bottom after all class definitions
 NODE_CLASS_MAPPINGS = {
     "FrameSequenceGenerator": FrameSequenceGenerator,
@@ -1206,6 +1360,7 @@ NODE_CLASS_MAPPINGS = {
     "DuoSelectorNode": DuoSelectorNode,
     "JudgeNode": JudgeNode,
     "AlphaRavisJudgeNode": AlphaRavisJudgeNode,
+    "BeatDropOutfitIteratorNode": BeatDropOutfitIteratorNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FrameSequenceGenerator": "🎬 Frame Sequence Generator",
@@ -1213,4 +1368,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DuoSelectorNode": "👥 Duo Selector (API Style)",
     "JudgeNode": "⚖️ Judge (Outfit Check + Penalty)",
     "AlphaRavisJudgeNode": "🧠 AlphaRavis Judge (Same Thread)",
+    "BeatDropOutfitIteratorNode": "🔁 BeatDrop Outfit Iterator",
 }
