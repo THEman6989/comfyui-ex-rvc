@@ -2,6 +2,16 @@
 
 Custom nodes for ComfyUI.
 
+## Text (Multiline + Search)
+
+Under `Amin/Text`, add **Text (Multiline + Search)** to a workflow. Its normal,
+resizable ComfyUI multiline text box accepts the full text and its output is a
+single, unchanged `STRING` (including newlines and trailing spaces). The search
+bar above it is only a frontend aid: type a literal word or phrase and press
+Enter or **Suchen**; use the up/down buttons or Shift+Enter/Enter for the
+previous/next occurrence. Search is case-insensitive and wraps at either end.
+The search query is not saved or included in the output.
+
 ## Load Image (API Push)
 
 Node display name:

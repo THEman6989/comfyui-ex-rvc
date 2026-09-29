@@ -17,6 +17,9 @@ from .mask_researcher_tools import NODE_CLASS_MAPPINGS as _mrt_class_mappings, N
 
 # Beatdrop / Outfit-Change Nodes
 from .beatdrop_nodes import NODE_CLASS_MAPPINGS as _bdn_class_mappings, NODE_DISPLAY_NAME_MAPPINGS as _bdn_display_mappings
+from .searchable_text import NODE_CLASS_MAPPINGS as _text_class_mappings, NODE_DISPLAY_NAME_MAPPINGS as _text_display_mappings
+
+WEB_DIRECTORY = "./web"
 
 # Frame Embedding Change Detector (DINOv2)
 try:
@@ -32,172 +35,21 @@ except Exception as exc:
 
 
 # ======================================================================
-# COMFYUI AUTO-STAY-AWAKE GUARD
-# KDE Plasma / CachyOS kompatibel
+# COMFYUI QUEUE-SCOPED SUSPEND-ONLY GUARD
+# Blocks standby only while a job is running/pending; display blanking remains available.
 # ======================================================================
-import os
-import subprocess
+import atexit
 import threading
 import time
-import atexit
-import shutil as _shutil
 import server
+
+from .suspend_only_inhibit import (
+    start_suspend_only_inhibit as _start_suspend_only_inhibit,
+    stop_suspend_only_inhibit as _stop_suspend_only_inhibit,
+)
 
 _auto_guard_proc = None
 _auto_guard_backend = None
-_auto_guard_kde_cookie = None
-
-
-def _run_quiet(cmd):
-    try:
-        return subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except Exception:
-        return None
-
-
-def _is_kde_plasma():
-    desktop = (
-        os.environ.get("XDG_CURRENT_DESKTOP", "")
-        + " "
-        + os.environ.get("DESKTOP_SESSION", "")
-    ).lower()
-
-    return (
-        "kde" in desktop
-        or "plasma" in desktop
-        or os.environ.get("KDE_FULL_SESSION") == "true"
-    )
-
-
-def _find_qdbus():
-    for cmd in ("qdbus6", "qdbus-qt6", "qdbus"):
-        if _shutil.which(cmd):
-            return cmd
-    return None
-
-
-def _start_kde_inhibit():
-    global _auto_guard_kde_cookie
-
-    qdbus = _find_qdbus()
-    if not qdbus:
-        print("\n>>> [ComfyUI Auto-Guard] qdbus nicht gefunden. Installiere: sudo pacman -S qt6-tools")
-        return False
-
-    try:
-        result = subprocess.run(
-            [
-                qdbus,
-                "org.freedesktop.PowerManagement",
-                "/org/freedesktop/PowerManagement/Inhibit",
-                "org.freedesktop.PowerManagement.Inhibit.Inhibit",
-                "ComfyUI",
-                "ComfyUI queue active",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
-            print(f"\n>>> [ComfyUI Auto-Guard] KDE PowerDevil Inhibit fehlgeschlagen: {err}")
-            return False
-
-        cookie = result.stdout.strip()
-
-        if not cookie:
-            print("\n>>> [ComfyUI Auto-Guard] KDE PowerDevil gab keinen Cookie zurück.")
-            return False
-
-        _auto_guard_kde_cookie = cookie
-        return True
-
-    except Exception as e:
-        print(f"\n>>> [ComfyUI Auto-Guard] KDE PowerDevil Fehler: {e}")
-        return False
-
-
-def _stop_kde_inhibit():
-    global _auto_guard_kde_cookie
-
-    if _auto_guard_kde_cookie is None:
-        return
-
-    qdbus = _find_qdbus()
-    if qdbus:
-        try:
-            subprocess.run(
-                [
-                    qdbus,
-                    "org.freedesktop.PowerManagement",
-                    "/org/freedesktop/PowerManagement/Inhibit",
-                    "org.freedesktop.PowerManagement.Inhibit.UnInhibit",
-                    str(_auto_guard_kde_cookie),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-                check=False,
-            )
-        except Exception:
-            pass
-
-    _auto_guard_kde_cookie = None
-
-
-def _start_systemd_inhibit():
-    if not _shutil.which("systemd-inhibit"):
-        return None
-
-    try:
-        proc = subprocess.Popen(
-            [
-                "systemd-inhibit",
-                "--what=idle:sleep",
-                "--mode=block",
-                "--who=ComfyUI",
-                "--why=ComfyUI queue active",
-                "sleep",
-                "infinity",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        time.sleep(0.5)
-
-        if proc.poll() is not None:
-            err = ""
-            try:
-                err = proc.stderr.read().strip() if proc.stderr else ""
-            except Exception:
-                pass
-
-            if err:
-                print(f"\n>>> [ComfyUI Auto-Guard] systemd-inhibit nicht nutzbar: {err}")
-
-            return None
-
-        return proc
-
-    except Exception as e:
-        print(f"\n>>> [ComfyUI Auto-Guard] systemd-inhibit Fehler: {e}")
-        return None
-
-
-def _heartbeat_keep_awake():
-    if _shutil.which("xdg-screensaver"):
-        _run_quiet(["xdg-screensaver", "reset"])
-
-    if os.environ.get("DISPLAY") and _shutil.which("xset"):
-        _run_quiet(["xset", "s", "reset"])
 
 
 def _start_auto_guard():
@@ -206,46 +58,39 @@ def _start_auto_guard():
     if _auto_guard_backend is not None:
         return
 
-    if _is_kde_plasma() and _start_kde_inhibit():
-        _auto_guard_backend = "kde-powerdevil"
-        print("\n>>> [ComfyUI Auto-Guard] Queue läuft! KDE PowerDevil blockiert Sleep. 🛡️")
+    backend, process = _start_suspend_only_inhibit(
+        "ComfyUI", "ComfyUI queue active"
+    )
+    if backend is None or process is None:
+        print(
+            "\n>>> [ComfyUI Auto-Guard] Kein Suspend-only-Inhibitor verfügbar; "
+            "Display-wachhaltende Fallbacks bleiben absichtlich deaktiviert."
+        )
         return
 
-    proc = _start_systemd_inhibit()
-    if proc is not None:
-        _auto_guard_proc = proc
-        _auto_guard_backend = "systemd-inhibit"
-        print("\n>>> [ComfyUI Auto-Guard] Queue läuft! systemd-inhibit aktiv. 🛡️")
-        return
-
-    _auto_guard_backend = "heartbeat"
-    print("\n>>> [ComfyUI Auto-Guard] Queue läuft! Heartbeat-Fallback aktiv. 🛡️")
+    _auto_guard_backend = backend
+    _auto_guard_proc = process
+    print(
+        f"\n>>> [ComfyUI Auto-Guard] Queue läuft! {backend} blockiert nur "
+        "Standby; der Bildschirm darf ausgehen. 🛡️"
+    )
 
 
 def _stop_auto_guard():
     global _auto_guard_proc, _auto_guard_backend
 
-    if _auto_guard_backend == "kde-powerdevil":
-        _stop_kde_inhibit()
-        print("\n>>> [ComfyUI Auto-Guard] Queue leer. KDE PowerDevil-Inhibit beendet. 😴")
-
-    elif _auto_guard_proc is not None:
-        try:
-            _auto_guard_proc.terminate()
-            _auto_guard_proc.wait(timeout=2)
-        except Exception:
-            try:
-                _auto_guard_proc.kill()
-            except Exception:
-                pass
-
-        print("\n>>> [ComfyUI Auto-Guard] Queue leer. systemd-inhibit beendet. 😴")
-
-    elif _auto_guard_backend == "heartbeat":
-        print("\n>>> [ComfyUI Auto-Guard] Queue leer. Heartbeat beendet. 😴")
-
-    _auto_guard_proc = None
+    backend = _auto_guard_backend
+    process = _auto_guard_proc
     _auto_guard_backend = None
+    _auto_guard_proc = None
+
+    if process is not None:
+        _stop_suspend_only_inhibit(process)
+        print(
+            f"\n>>> [ComfyUI Auto-Guard] Queue leer. "
+            f"Suspend-only-Inhibitor beendet ({backend}); "
+            "Plasma-Idle-Timer neu gestartet. 😴"
+        )
 
 
 def _monitor_comfy_queue():
@@ -261,7 +106,6 @@ def _monitor_comfy_queue():
 
             if queue_active:
                 _start_auto_guard()
-                _heartbeat_keep_awake()
             else:
                 _stop_auto_guard()
 
@@ -272,7 +116,6 @@ def _monitor_comfy_queue():
 
 
 atexit.register(_stop_auto_guard)
-
 threading.Thread(target=_monitor_comfy_queue, daemon=True).start()
 # ======================================================================
 
@@ -1609,6 +1452,7 @@ NODE_CLASS_MAPPINGS = {
     
     # Beatdrop / Outfit-Change Nodes
     **_bdn_class_mappings,
+    **_text_class_mappings,
 
     # Mask Researcher Tools
     **_mrt_class_mappings,
@@ -1635,6 +1479,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     
     # Beatdrop / Outfit-Change Nodes
     **_bdn_display_mappings,
+    **_text_display_mappings,
 
     # Mask Researcher Tools
     **_mrt_display_mappings,

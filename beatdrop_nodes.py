@@ -1353,6 +1353,527 @@ class BeatDropOutfitIteratorNode:
         )
 
 
+class BeatDropWanAnalysisPackageWriterNode:
+    """Persist WAN preparation data as PNG sequences in an immutable job folder."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference_images": ("IMAGE",),
+                "face_images": ("IMAGE",),
+                "mimic_images": ("IMAGE",),
+                "background_images": ("IMAGE",),
+                "input_video_images": ("IMAGE",),
+                "resolution_reference": ("IMAGE",),
+                "void_joined_images": ("IMAGE",),
+                "character_masks": ("MASK",),
+                "segmentation_mask": ("MASK",),
+                "fps": ("FLOAT", {"default": 24.0, "min": 0.01, "max": 1000.0}),
+                "width": ("INT", {"default": 832, "min": 1, "max": 16384}),
+                "height": ("INT", {"default": 480, "min": 1, "max": 16384}),
+                "frame_count": ("INT", {"default": 1, "min": 1, "max": 1000000}),
+                "video_id": ("STRING", {"default": "video"}),
+                "run_id": ("STRING", {"default": "run"}),
+                "package_root": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "immutable_base_prompt": ("STRING", {"default": "", "multiline": True}),
+                "scene_prompt": ("STRING", {"default": "", "multiline": True}),
+                "plan_json": ("STRING", {"default": "", "multiline": True}),
+                "source_video": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("package_dir", "manifest_json")
+    FUNCTION = "write_package"
+    CATEGORY = "Amin/Beatdrop/Wan"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _safe_id(name, value):
+        if not isinstance(value, str) or not value or any(
+            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for char in value
+        ) or value in {".", ".."}:
+            raise ValueError(f"{name} must contain only letters, numbers, dot, underscore, or hyphen")
+        return value
+
+    @staticmethod
+    def _validate_image(name, value, channels=None):
+        if not isinstance(value, torch.Tensor) or value.ndim != 4 or value.shape[0] < 1:
+            raise ValueError(f"{name} must be a nonempty 4-D tensor")
+        if channels is not None and value.shape[-1] != channels:
+            raise ValueError(f"{name} must have {channels} channels")
+        if not value.dtype.is_floating_point:
+            raise ValueError(f"{name} must use a floating-point dtype")
+
+    @staticmethod
+    def _validate_mask(value):
+        if not isinstance(value, torch.Tensor) or value.ndim != 3 or value.shape[0] < 1:
+            raise ValueError("character_masks must be a nonempty 3-D tensor")
+        if not value.dtype.is_floating_point:
+            raise ValueError("character_masks must use a floating-point dtype")
+
+    @staticmethod
+    def _save_image_pngs(images, directory):
+        directory.mkdir(parents=True)
+        for index, image in enumerate(images.detach().cpu()):
+            array = image.clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
+            Image.fromarray(array, mode="RGB").save(directory / f"{index:06d}.png")
+
+    @staticmethod
+    def _save_mask_pngs(masks, directory):
+        directory.mkdir(parents=True)
+        for index, mask in enumerate(masks.detach().cpu()):
+            array = mask.clamp(0, 1).mul(65535).round().to(torch.int32).numpy().astype(np.uint16)
+            Image.fromarray(array).save(directory / f"{index:06d}.png")
+
+    @staticmethod
+    def _sha256(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def write_package(
+        self,
+        reference_images,
+        face_images,
+        mimic_images,
+        background_images,
+        input_video_images,
+        resolution_reference,
+        void_joined_images,
+        character_masks,
+        segmentation_mask,
+        fps,
+        width,
+        height,
+        frame_count,
+        video_id,
+        run_id,
+        package_root,
+        immutable_base_prompt="",
+        scene_prompt="",
+        plan_json="",
+        source_video="",
+    ):
+        video_id = self._safe_id("video_id", video_id)
+        run_id = self._safe_id("run_id", run_id)
+        for name, tensor in (
+            ("reference_images", reference_images),
+            ("face_images", face_images),
+            ("mimic_images", mimic_images),
+            ("background_images", background_images),
+            ("input_video_images", input_video_images),
+            ("resolution_reference", resolution_reference),
+            ("void_joined_images", void_joined_images),
+        ):
+            self._validate_image(name, tensor, channels=3)
+        self._validate_mask(character_masks)
+        self._validate_mask(segmentation_mask)
+        if not isinstance(fps, (int, float)) or isinstance(fps, bool) or fps <= 0:
+            raise ValueError("fps must be positive")
+        for name, value in (("width", width), ("height", height), ("frame_count", frame_count)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if plan_json:
+            try:
+                _json.loads(plan_json)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("plan_json must be valid JSON when provided") from exc
+
+        root = Path(package_root).expanduser() if package_root else Path(folder_paths.get_output_directory()) / "beatdrop_jobs"
+        target = root.resolve() / video_id / run_id
+        if target.exists():
+            raise FileExistsError(f"package already exists: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = target.parent / f".{run_id}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
+        staging.mkdir()
+        try:
+            tensors = {
+                "reference_images": reference_images,
+                "face_images": face_images,
+                "mimic_images": mimic_images,
+                "background_images": background_images,
+                "input_video_images": input_video_images,
+                "resolution_reference": resolution_reference,
+                "void_joined_images": void_joined_images,
+                "character_masks": character_masks,
+                "segmentation_mask": segmentation_mask,
+            }
+            for name, tensor in tensors.items():
+                if name in {"character_masks", "segmentation_mask"}:
+                    self._save_mask_pngs(tensor, staging / name)
+                else:
+                    self._save_image_pngs(tensor, staging / name)
+
+            packaged_source = ""
+            if source_video:
+                source = Path(source_video).expanduser().resolve()
+                if not source.is_file():
+                    raise FileNotFoundError(f"source_video does not exist: {source}")
+                source_dir = staging / "source"
+                source_dir.mkdir()
+                destination = source_dir / source.name
+                try:
+                    os.link(source, destination)
+                except OSError:
+                    shutil.copy2(source, destination)
+                packaged_source = destination.relative_to(staging).as_posix()
+
+            files = {}
+            for artifact in sorted(path for path in staging.rglob("*") if path.is_file()):
+                relative = artifact.relative_to(staging).as_posix()
+                files[relative] = {"sha256": self._sha256(artifact), "bytes": artifact.stat().st_size}
+            manifest = {
+                "schema": "beatdrop_wan_analysis_package/v2",
+                "video_id": video_id,
+                "run_id": run_id,
+                "fps": float(fps),
+                "width": width,
+                "height": height,
+                "frame_count": frame_count,
+                "immutable_base_prompt": immutable_base_prompt,
+                "scene_prompt": scene_prompt,
+                "plan_json": plan_json,
+                "source_video": packaged_source,
+                "representations": {
+                    "images": {"format": "png", "bit_depth": 8, "channels": 3},
+                    "masks": {"format": "png", "bit_depth": 16, "channels": 1},
+                },
+                "tensors": {
+                    name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+                    for name, tensor in tensors.items()
+                },
+                "files": files,
+            }
+            manifest_text = _json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2)
+            (staging / "manifest.json").write_text(manifest_text + "\n", encoding="utf-8")
+            # Re-open and verify every committed artifact before publishing the
+            # package atomically. READY is deliberately excluded from the
+            # manifest and is written last inside the staging directory.
+            verified_manifest = _json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+            for relative, metadata in verified_manifest["files"].items():
+                artifact = staging / relative
+                if not artifact.is_file() or self._sha256(artifact) != metadata["sha256"]:
+                    raise ValueError(f"package self-verification failed for {relative}")
+            (staging / "READY").write_text(
+                "beatdrop_wan_analysis_package/v2\n", encoding="utf-8"
+            )
+            os.replace(staging, target)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return (str(target), manifest_text)
+
+
+class BeatDropWanAnalysisPackageReaderNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "package_dir": ("STRING", {"default": ""}),
+                "verify_hashes": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = (
+        "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "MASK", "MASK",
+        "FLOAT", "INT", "INT", "INT", "STRING", "STRING", "STRING", "STRING", "STRING",
+    )
+    RETURN_NAMES = (
+        "reference_images", "face_images", "mimic_images", "background_images",
+        "input_video_images", "resolution_reference", "void_joined_images",
+        "character_masks", "segmentation_mask",
+        "fps", "width", "height", "frame_count", "immutable_base_prompt",
+        "scene_prompt", "plan_json", "source_video", "manifest_json",
+    )
+    FUNCTION = "read_package"
+    CATEGORY = "Amin/Beatdrop/Wan"
+
+    @staticmethod
+    def _artifact(root, relative):
+        candidate = (root / relative).resolve()
+        if root != candidate and root not in candidate.parents:
+            raise ValueError("manifest artifact escapes package directory")
+        return candidate
+
+    @staticmethod
+    def _sha256(path):
+        return BeatDropWanAnalysisPackageWriterNode._sha256(path)
+
+    @staticmethod
+    def _load_png_sequence(root, name, is_mask):
+        directory = BeatDropWanAnalysisPackageReaderNode._artifact(root, name)
+        paths = sorted(directory.glob("*.png"))
+        if not paths:
+            raise ValueError(f"PNG sequence is empty: {name}")
+        frames = []
+        for path in paths:
+            with Image.open(path) as image:
+                if is_mask:
+                    array = np.asarray(image, dtype=np.uint16).copy()
+                    frames.append(torch.from_numpy(array.astype(np.float32)).div(65535.0))
+                else:
+                    array = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+                    frames.append(torch.from_numpy(array).to(torch.float32).div(255.0))
+        return torch.stack(frames)
+
+    def read_package(self, package_dir, verify_hashes):
+        root = Path(package_dir).expanduser().resolve()
+        manifest_path = root / "manifest.json"
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        manifest = _json.loads(manifest_text)
+        schema = manifest.get("schema")
+        if schema not in {
+            "beatdrop_wan_analysis_package/v1",
+            "beatdrop_wan_analysis_package/v2",
+        }:
+            raise ValueError("unsupported BeatDrop WAN package schema")
+        ready_path = root / "READY"
+        if not ready_path.is_file() or ready_path.read_text(encoding="utf-8") != f"{schema}\n":
+            raise ValueError("BeatDrop WAN package is incomplete: valid READY marker missing")
+        if verify_hashes:
+            for relative, metadata in manifest.get("files", {}).items():
+                artifact = self._artifact(root, relative)
+                if not artifact.is_file() or self._sha256(artifact) != metadata.get("sha256"):
+                    raise ValueError(f"SHA-256 verification failed for {relative}")
+
+        names = (
+            "reference_images", "face_images", "mimic_images",
+            "background_images", "input_video_images", "resolution_reference",
+            "void_joined_images", "character_masks", "segmentation_mask",
+        )
+        loaded = []
+        for name in names:
+            if schema == "beatdrop_wan_analysis_package/v1":
+                path = self._artifact(root, f"tensors/{name}.pt")
+                tensor = torch.load(path, map_location="cpu", weights_only=True)
+            else:
+                tensor = self._load_png_sequence(
+                    root,
+                    name,
+                    is_mask=name in {"character_masks", "segmentation_mask"},
+                )
+            loaded.append(tensor)
+        source_relative = manifest.get("source_video") or ""
+        source_video = str(self._artifact(root, source_relative)) if source_relative else ""
+        return (
+            *loaded,
+            float(manifest["fps"]),
+            int(manifest["width"]),
+            int(manifest["height"]),
+            int(manifest["frame_count"]),
+            str(manifest.get("immutable_base_prompt") or ""),
+            str(manifest.get("scene_prompt") or ""),
+            str(manifest.get("plan_json") or ""),
+            source_video,
+            manifest_text,
+        )
+
+
+class BeatDropWanSegmentFinalizerNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "expected_visible_frames": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 1000000, "step": 1},
+                ),
+                "motion_tail_frames": (
+                    "INT",
+                    {"default": 9, "min": 1, "max": 16384, "step": 1},
+                ),
+                "append_black_frame": ("BOOLEAN", {"default": False}),
+                "black_frame_count": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 64, "step": 1},
+                ),
+                "run_id": ("STRING",),
+                "attempt_id": ("STRING",),
+                "plan_hash": ("STRING",),
+                "segment_index": ("INT", {"default": 0, "min": 0}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "STRING")
+    RETURN_NAMES = (
+        "final_images",
+        "continuation_images",
+        "continuation_masks",
+        "metadata_json",
+    )
+    FUNCTION = "finalize"
+    CATEGORY = "Amin/Beatdrop/Wan"
+
+    @staticmethod
+    def _require_int_range(name, value, minimum, maximum):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+        if value < minimum or value > maximum:
+            raise ValueError(
+                f"{name} must be between {minimum} and {maximum}"
+            )
+
+    @staticmethod
+    def _require_non_negative_int(name, value):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+
+    @staticmethod
+    def _require_identity(name, value):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a nonblank string")
+
+    @staticmethod
+    def _validate_images(images):
+        if not isinstance(images, torch.Tensor):
+            raise ValueError("images must be a torch.Tensor")
+        if images.ndim != 4:
+            raise ValueError("images must be a 4-D IMAGE batch")
+        if images.shape[0] == 0 or images.numel() == 0:
+            raise ValueError("images batch must be nonempty")
+        if images.shape[-1] != 3:
+            raise ValueError(
+                "images must use BHWC layout with exactly 3 channels"
+            )
+        if not images.dtype.is_floating_point:
+            raise ValueError("images must use a floating-point dtype")
+
+    def finalize(
+        self,
+        images,
+        expected_visible_frames,
+        motion_tail_frames,
+        append_black_frame,
+        black_frame_count,
+        run_id,
+        attempt_id,
+        plan_hash,
+        segment_index,
+    ):
+        self._validate_images(images)
+        self._require_int_range(
+            "expected_visible_frames", expected_visible_frames, 1, 1000000
+        )
+        self._require_int_range(
+            "motion_tail_frames", motion_tail_frames, 1, 16384
+        )
+        self._require_int_range(
+            "black_frame_count", black_frame_count, 1, 64
+        )
+        self._require_non_negative_int("segment_index", segment_index)
+        if not isinstance(append_black_frame, bool):
+            raise ValueError("append_black_frame must be a boolean")
+        for name, value in (
+            ("run_id", run_id),
+            ("attempt_id", attempt_id),
+            ("plan_hash", plan_hash),
+        ):
+            self._require_identity(name, value)
+        if images.shape[0] < expected_visible_frames:
+            raise ValueError(
+                "images batch is shorter than expected_visible_frames"
+            )
+
+        visible = images[:expected_visible_frames]
+        tail_count = min(motion_tail_frames, visible.shape[0])
+        motion_tail = visible[-tail_count:]
+        reset_count = black_frame_count if append_black_frame else 0
+        if reset_count:
+            reset_frames = torch.zeros(
+                (reset_count, *visible.shape[1:]),
+                dtype=visible.dtype,
+                device=visible.device,
+            )
+            final_images = torch.cat((visible, reset_frames), dim=0)
+            continuation = torch.cat((motion_tail, reset_frames), dim=0)
+        else:
+            final_images = visible
+            continuation = motion_tail
+        masks = torch.zeros(
+            (continuation.shape[0], continuation.shape[1], continuation.shape[2]),
+            dtype=continuation.dtype,
+            device=continuation.device,
+        )
+        metadata = {
+            "attempt_id": attempt_id,
+            "continuation_frame_count": continuation.shape[0],
+            "motion_tail_frame_count": tail_count,
+            "plan_hash": plan_hash,
+            "reset_frame_count": reset_count,
+            "run_id": run_id,
+            "segment_index": segment_index,
+            "visible_frame_count": visible.shape[0],
+        }
+        return (
+            final_images,
+            continuation,
+            masks,
+            _json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+        )
+
+
+def normalize_wan_frame_count(requested):
+    """Largest positive 4k+1 length that fits in the requested WAN window."""
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
+        raise ValueError("requested frame count must be a positive integer")
+    return 1 + 4 * ((requested - 1) // 4)
+
+
+class BeatDropWanContinuationConfigNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        frame_input = ("INT", {"default": 70, "min": 1, "max": 16384, "step": 1})
+        context_input = ("INT", {"default": 13, "min": 1, "max": 16384, "step": 1})
+        return {"required": {
+            "requested_window_frames": frame_input,
+            "requested_context_frames": context_input,
+            "mode": (["initial", "internal_continue", "outfit_transition"],),
+            "black_frame_count": ("INT", {"default": 1, "min": 1, "max": 1, "step": 1}),
+        }}
+
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = (
+        "wan_length", "continue_motion_max_frames", "visible_capacity",
+        "motion_context_frames", "black_frame_count", "config_json",
+    )
+    FUNCTION = "configure"
+    CATEGORY = "Amin/Beatdrop/Wan"
+
+    def configure(self, requested_window_frames, requested_context_frames, mode, black_frame_count):
+        wan_length = normalize_wan_frame_count(requested_window_frames)
+        context = normalize_wan_frame_count(requested_context_frames)
+        if mode not in ("initial", "internal_continue", "outfit_transition"):
+            raise ValueError("unsupported continuation mode")
+        if mode == "outfit_transition" and (type(black_frame_count) is not int or black_frame_count != 1):
+            raise ValueError("black_frame_count must be exactly 1 for outfit_transition")
+        if mode != "initial" and context >= wan_length:
+            raise ValueError("context must be smaller than the WAN window")
+        effective_context = 0 if mode == "initial" else context
+        black = 1 if mode == "outfit_transition" else 0
+        motion = effective_context - black
+        visible = wan_length - effective_context
+        config = {
+            "black_frame_count": black,
+            "effective_context_frames": effective_context,
+            "mode": mode,
+            "motion_context_frames": motion,
+            "requested_context_frames": requested_context_frames,
+            "requested_window_frames": requested_window_frames,
+            "temporal_alignment": "4k+1",
+            "visible_capacity": visible,
+            "wan_length": wan_length,
+        }
+        return (wan_length, context, visible, motion, black, _json.dumps(config, sort_keys=True))
+
+
 # ComfyUI registration — at bottom after all class definitions
 NODE_CLASS_MAPPINGS = {
     "FrameSequenceGenerator": FrameSequenceGenerator,
@@ -1361,6 +1882,10 @@ NODE_CLASS_MAPPINGS = {
     "JudgeNode": JudgeNode,
     "AlphaRavisJudgeNode": AlphaRavisJudgeNode,
     "BeatDropOutfitIteratorNode": BeatDropOutfitIteratorNode,
+    "BeatDropWanAnalysisPackageWriterNode": BeatDropWanAnalysisPackageWriterNode,
+    "BeatDropWanAnalysisPackageReaderNode": BeatDropWanAnalysisPackageReaderNode,
+    "BeatDropWanSegmentFinalizerNode": BeatDropWanSegmentFinalizerNode,
+    "BeatDropWanContinuationConfigNode": BeatDropWanContinuationConfigNode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FrameSequenceGenerator": "🎬 Frame Sequence Generator",
@@ -1369,4 +1894,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "JudgeNode": "⚖️ Judge (Outfit Check + Penalty)",
     "AlphaRavisJudgeNode": "🧠 AlphaRavis Judge (Same Thread)",
     "BeatDropOutfitIteratorNode": "🔁 BeatDrop Outfit Iterator",
+    "BeatDropWanAnalysisPackageWriterNode": "📦 BeatDrop WAN Analysis Package Writer",
+    "BeatDropWanAnalysisPackageReaderNode": "📂 BeatDrop WAN Analysis Package Reader",
+    "BeatDropWanSegmentFinalizerNode": "🎞️ BeatDrop WAN Segment Finalizer",
+    "BeatDropWanContinuationConfigNode": "🧮 BeatDrop WAN Continuation Config",
 }

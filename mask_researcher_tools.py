@@ -893,6 +893,10 @@ class MaskDiffPreview(SaveImage):
             preview_arr = np.repeat(diff[..., None], 3, axis=-1)
         preview_tensor = to_image_tensor(preview_arr)
         ui = self.save_images(preview_tensor, "MaskDiffPreview", prompt, extra_pnginfo)
+        # Legacy SaveImage returns all files but does not tell the current ComfyUI
+        # frontend that they form a frame sequence. Without this flag the node UI
+        # can remain on the first diff even though later frames were saved.
+        ui.setdefault("ui", {})["animated"] = (batch_size > 1,)
         return {
             **ui,
             "result": (to_mask_tensor(diff),),
