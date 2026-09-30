@@ -83,6 +83,13 @@ test("finds literal text by Enter, wraps with arrows, never changes output widge
   expect(textWidget.value).toBe("a.c\nA.C\nother");
 });
 
+test("search input is treated as editable text by ComfyUI's clipboard handler", () => {
+  const { query } = setup("alpha");
+  // ComfyUI's shouldIgnoreCopyPaste excludes input[type=search] but accepts text.
+  // Browser context-menu Paste must reach the input, not clone selected nodes.
+  expect(query.type).toBe("text");
+});
+
 test("search button, no results and query changes", () => {
   const { textarea, query, search, status } = setup("one\nTwo one");
   query.value = "missing";

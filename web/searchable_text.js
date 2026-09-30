@@ -38,7 +38,7 @@ export function attachTextSearch(node) {
   };
   updateToolbarWidth();
   const query = document.createElement("input");
-  query.type = "search";
+  query.type = "text";
   query.placeholder = "Im Text suchen";
   query.setAttribute("aria-label", "Im Text suchen");
   query.style.cssText = "min-width:0;flex:1;background:var(--comfy-input-bg,#222);color:inherit;border:1px solid #666;border-radius:4px;padding:4px;";
