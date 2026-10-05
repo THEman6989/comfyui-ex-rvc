@@ -43,6 +43,10 @@ import threading
 import time
 import server
 
+# Quick Pause retains the existing sampler invocation and all tensor placements.
+from .sampling_pause import install as _install_sampling_pause
+_install_sampling_pause()
+
 from .suspend_only_inhibit import (
     start_suspend_only_inhibit as _start_suspend_only_inhibit,
     stop_suspend_only_inhibit as _stop_suspend_only_inhibit,

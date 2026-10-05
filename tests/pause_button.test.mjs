@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const path = new URL('../web/pause_button.js', import.meta.url);
+assert.ok(fs.existsSync(path), 'Pause toolbar extension is not implemented');
+const context = vm.createContext({ console, setTimeout, clearTimeout });
+const module = new vm.SourceTextModule(fs.readFileSync(path, 'utf8'), { context });
+await module.link((specifier) => new vm.SyntheticModule([specifier.includes('app.js') ? 'app' : 'api'], function() {
+  this.setExport(specifier.includes('app.js') ? 'app' : 'api', specifier.includes('app.js') ? { registerExtension() {} } : {});
+}, { context }));
+await module.evaluate();
+const view = module.namespace.buttonView;
+assert.equal(view({sampling_active:false}).disabled, true);
+assert.equal(view({sampling_active:true,supported:true}).icon, '■');
+assert.equal(view({sampling_active:true,supported:true,pause_requested:true}).icon, '■ …');
+assert.equal(view({sampling_active:true,supported:true,paused:true}).icon, '▶');
+assert.equal(view({sampling_active:true,supported:false}).disabled, true);
+assert.equal(view({sampling_active:true,supported:true,paused:true}).route, '/sampling_resume');
+assert.equal(view({sampling_active:true,supported:true,pause_requested:true}).route, '/sampling_resume');
+console.log('PASS: toolbar idle/running/pending/paused/unsupported + resume route');
